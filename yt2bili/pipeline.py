@@ -216,12 +216,66 @@ def _execute(
     task.status = "submitted"
     task.error = ""
     store.upsert(task)
+    _cleanup_uploaded_files(settings, store, work_dir)
+    task.work_dir = ""
+    task.video_path = ""
+    task.cover_path = ""
+    store.upsert(task)
     logger.info("完成。投稿成功不等于已过审。")
     return task
 
 
 def _ok(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
+
+
+def _cleanup_uploaded_files(
+    settings: Settings, store: TaskStore, current_work_dir: Path
+) -> None:
+    _detach_file_handler(current_work_dir / "pipeline.log")
+    targets = {current_work_dir.resolve()}
+    for item in store.list_all():
+        if item.status != "submitted" or not item.work_dir:
+            continue
+        targets.add(Path(item.work_dir))
+    for path in targets:
+        _remove_work_dir(settings.work_dir, path)
+    for item in store.list_all():
+        if item.status != "submitted":
+            continue
+        if not (item.work_dir or item.video_path or item.cover_path):
+            continue
+        item.work_dir = ""
+        item.video_path = ""
+        item.cover_path = ""
+        store.upsert(item)
+
+
+def _remove_work_dir(work_root: Path, target: Path) -> None:
+    root = work_root.resolve()
+    try:
+        resolved = target.resolve()
+    except OSError:
+        return
+    if resolved == root or root not in resolved.parents:
+        logger.warning("拒绝删除工作目录之外的路径：%s", resolved)
+        return
+    if not resolved.exists():
+        return
+    try:
+        shutil.rmtree(resolved)
+        logger.info("已删除已投稿文件：%s", resolved)
+    except OSError as exc:
+        logger.warning("删除 %s 失败：%s", resolved, exc)
+
+
+def _detach_file_handler(log_path: Path) -> None:
+    marker = str(log_path.resolve())
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if getattr(handler, "_yt2bili_path", None) == marker:
+            handler.close()
+            root.removeHandler(handler)
 
 
 def _attach_file_handler(log_path: Path) -> None:

@@ -99,6 +99,6 @@ YOUTUBE_COOKIES=secrets/youtube_cookies.txt
 4. DeepL Free 翻译标题和简介（已是中文则跳过），标题截到 80 字  
 5. 调用 `biliup upload` 提交稿件（创作声明：内容无需标注）  
 
-`--dry-run` 在第 5 步之前停下。Cookie 过期时重新 `login`。投稿成功只表示已进入审核，不表示已过审。
+`--dry-run` 在第 5 步之前停下。Cookie 过期时重新 `login`。投稿成功只表示已进入审核，不表示已过审。投稿成功后会自动删除该稿件在 `work\` 下的本地文件（视频、封面等），任务记录仍留在数据库里。
 
 非正式会员大约每天最多 5 条；上传过快会被限流，稍等再 `retry`。
