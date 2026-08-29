@@ -22,6 +22,8 @@ class Settings:
     work_dir: Path
     data_dir: Path
     bin_dir: Path
+    download_jobs: int = 2
+    upload_gap_seconds: int = 30
     desc_limit: int = 2000
     title_limit: int = 80
     cover_width: int = 1280
@@ -49,6 +51,8 @@ def load_settings() -> Settings:
     tid = int(os.getenv("BILI_TID", "171"))
     # Auto-probe often picks bldsa, whose CDN cert currently fails rustls on Windows.
     line = os.getenv("BILI_LINE", "tx").strip() or "tx"
+    download_jobs = _env_int("DOWNLOAD_JOBS", 2, lo=1, hi=8)
+    upload_gap_seconds = _env_int("UPLOAD_GAP_SECONDS", 30, lo=0, hi=600)
 
     work_dir = ROOT / "work"
     data_dir = ROOT / "data"
@@ -70,4 +74,17 @@ def load_settings() -> Settings:
         work_dir=work_dir,
         data_dir=data_dir,
         bin_dir=bin_dir,
+        download_jobs=download_jobs,
+        upload_gap_seconds=upload_gap_seconds,
     )
+
+
+def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(lo, min(hi, value))

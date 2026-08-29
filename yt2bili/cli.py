@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 
 from yt2bili import bili_upload, pipeline
 from yt2bili.config import load_settings
@@ -22,6 +23,7 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    pipeline.install_log_filter()
 
     settings = load_settings()
     store = TaskStore(settings.data_dir / "tasks.sqlite")
@@ -63,14 +65,35 @@ def _dispatch(args: argparse.Namespace, settings, store: TaskStore) -> int:
             logger.info("%s  %s  %s%s%s", task.video_id, task.status, title, extra, err)
         return 0
     if command == "run":
-        task = pipeline.run(
+        urls = list(args.urls or [])
+        if args.file:
+            urls.extend(_read_url_file(args.file))
+        if not urls:
+            raise Yt2BiliError("请提供至少一个 YouTube 链接，或用 --file 指定列表文件。")
+        jobs = args.jobs if args.jobs is not None else settings.download_jobs
+        if len(urls) == 1 and not args.file:
+            task = pipeline.run(
+                settings,
+                store,
+                urls[0],
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+            _print_result(task, args.dry_run)
+            return 0
+        results, failures = pipeline.run_many(
             settings,
             store,
-            args.url,
+            urls,
             dry_run=args.dry_run,
             force=args.force,
+            jobs=jobs,
         )
-        _print_result(task, args.dry_run)
+        for task in results:
+            _print_result(task, args.dry_run)
+        if failures:
+            logger.error("%s 条失败。", len(failures))
+            return 1
         return 0
     if command == "retry":
         task = pipeline.retry(
@@ -97,7 +120,7 @@ def _print_result(task, dry_run: bool) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="yt2bili",
-        description="将你有权转载的 YouTube 单条视频下载、翻译并投稿到 B 站。",
+        description="将你有权转载的 YouTube 视频下载、翻译并投稿到 B 站。",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -106,8 +129,22 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("renew", help="刷新 B 站登录态")
     sub.add_parser("list", help="列出本地任务")
 
-    run_p = sub.add_parser("run", help="处理一条 YouTube 链接")
-    run_p.add_argument("url", help="YouTube 视频链接")
+    run_p = sub.add_parser("run", help="处理一条或多条 YouTube 链接")
+    run_p.add_argument("urls", nargs="*", help="YouTube 视频链接（可多条）")
+    run_p.add_argument(
+        "-f",
+        "--file",
+        metavar="PATH",
+        help="从文本文件读取链接，每行一条；空行和 # 开头的行会忽略",
+    )
+    run_p.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="同时下载的路数（默认 2，最大 8）。上传始终排队，不会并行投稿",
+    )
     run_p.add_argument(
         "--dry-run",
         action="store_true",
@@ -123,6 +160,21 @@ def _build_parser() -> argparse.ArgumentParser:
     retry_p.add_argument("video_id", help="YouTube 视频 ID")
     retry_p.add_argument("--dry-run", action="store_true", help="续跑但不上传")
     return parser
+
+
+def _read_url_file(path: str) -> list[str]:
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise Yt2BiliError(f"找不到链接列表文件：{file_path}")
+    urls: list[str] = []
+    for line in file_path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        urls.append(text)
+    if not urls:
+        raise Yt2BiliError(f"{file_path} 里没有有效链接。")
+    return urls
 
 
 def _configure_stdio() -> None:

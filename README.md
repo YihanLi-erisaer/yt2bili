@@ -1,8 +1,8 @@
 # yt2bili
 
-把**你有权转载**的单条 YouTube 视频下载下来，用 DeepL 把标题和简介译成中文，再投稿到 B 站。
+把**你有权转载**的 YouTube 视频下载下来，用 DeepL 把标题和简介译成中文，再投稿到 B 站。
 
-只支持一条链接。创作声明为「内容无需标注」，简介末尾会带上原标题、原作者和原链接。
+支持一次传入多条链接：下载和封面处理可以并行，B 站上传会自动排队（同一账号不并行投稿）。创作声明为「内容无需标注」，简介末尾会带上原标题、原作者和原链接。
 
 ## 使用前
 
@@ -59,6 +59,18 @@ python -m yt2bili run "https://www.youtube.com/watch?v=xxxxxxxxxxx" --dry-run
 python -m yt2bili run "https://www.youtube.com/watch?v=xxxxxxxxxxx"
 ```
 
+一次处理多条（并行下载，上传排队）：
+
+```powershell
+python -m yt2bili run "https://www.youtube.com/watch?v=aaa" "https://www.youtube.com/watch?v=bbb" -j 3
+```
+
+或从文本文件读取链接（每行一条，`#` 开头为注释）：
+
+```powershell
+python -m yt2bili run --file urls.txt
+```
+
 失败后续跑（不会无故重下已有的 `video.mp4`）：
 
 ```powershell
@@ -84,6 +96,8 @@ python -m yt2bili renew
 | 创作声明 | 内容无需标注（Web 投稿，不勾选自制禁转） | 固定 |
 | 分辨率 | yt-dlp 能下到的最高画质；已是 MP4 则不转码，其它格式再转成 MP4 | 无上限 |
 | 时长 | 不限制 | — |
+| 并行下载 | 2 路（最大 8） | `-j` 或 `.env` 里 `DOWNLOAD_JOBS` |
+| 上传间隔 | 30 秒 | `.env` 里 `UPLOAD_GAP_SECONDS` |
 
 年龄限制等需要登录才能看的 YouTube 视频：从浏览器导出 Netscape 格式 cookies，放到例如 `secrets\youtube_cookies.txt`，并在 `.env` 中设置：
 
@@ -101,4 +115,6 @@ YOUTUBE_COOKIES=secrets/youtube_cookies.txt
 
 `--dry-run` 在第 5 步之前停下。Cookie 过期时重新 `login`。投稿成功只表示已进入审核，不表示已过审。投稿成功后会自动删除该稿件在 `work\` 下的本地文件（视频、封面等），任务记录仍留在数据库里。
 
-非正式会员大约每天最多 5 条；上传过快会被限流，稍等再 `retry`。
+多条链接时，下载/转码/封面可以同时进行；DeepL 翻译和 B 站上传会串行，避免限流。其中一条失败不会中断其它条。已经投稿成功的视频在批量模式下会跳过（单条仍会报错，可用 `--force` 重做）。
+
+非正式会员大约每天最多 5 条；上传过快会被限流，稍等再 `retry`。不要对同一账号并行打开多个上传进程。
