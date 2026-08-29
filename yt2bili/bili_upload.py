@@ -127,12 +127,16 @@ def upload(
             str(settings.bili_cookies),
             "upload",
             str(video),
+            "--submit",
+            "web",
             "--line",
             line_name,
             "--copyright",
             "1",
+            "--no-reprint",
+            "0",
             "--extra-fields",
-            json.dumps({"neutral_mark": "内容无需标注"}, ensure_ascii=False),
+            json.dumps({"web_os": 3, "recreate": -1}, ensure_ascii=False),
             "--tid",
             str(settings.bili_tid),
             "--cover",
@@ -145,7 +149,7 @@ def upload(
             settings.bili_tags,
         ]
         logger.info(
-            "开始上传到 B 站（分区 tid=%s，线路 %s，创作声明：内容无需标注）",
+            "开始上传到 B 站（分区 tid=%s，线路 %s，Web投稿，创作声明：内容无需标注）",
             settings.bili_tid,
             line_name,
         )
