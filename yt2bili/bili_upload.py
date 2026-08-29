@@ -130,9 +130,9 @@ def upload(
             "--line",
             line_name,
             "--copyright",
-            "2",
-            "--source",
-            source_url,
+            "1",
+            "--extra-fields",
+            json.dumps({"neutral_mark": "内容无需标注"}, ensure_ascii=False),
             "--tid",
             str(settings.bili_tid),
             "--cover",
@@ -144,7 +144,11 @@ def upload(
             "--tag",
             settings.bili_tags,
         ]
-        logger.info("开始上传到 B 站（分区 tid=%s，线路 %s，转载）", settings.bili_tid, line_name)
+        logger.info(
+            "开始上传到 B 站（分区 tid=%s，线路 %s，创作声明：内容无需标注）",
+            settings.bili_tid,
+            line_name,
+        )
         code, output = _run_logged(cmd)
         last_output = output
         if code == 0:

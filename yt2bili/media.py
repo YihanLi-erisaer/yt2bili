@@ -21,66 +21,51 @@ def require_ffmpeg() -> None:
 
 
 def ensure_bilibili_mp4(source: Path, dest: Path) -> Path:
-    require_ffmpeg()
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and dest.stat().st_size > 0:
-        logger.info("已存在转码结果，跳过：%s", dest)
+        logger.info("已存在 video.mp4，跳过转换：%s", dest)
         return dest
 
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise Yt2BiliError(f"源视频无效：{source}")
+
+    if source.suffix.lower() == ".mp4":
+        if source.resolve() != dest.resolve():
+            logger.info("源文件已是 MP4，跳过转换：%s", source)
+            shutil.copy2(source, dest)
+        return dest
+
+    require_ffmpeg()
     streams = _probe_streams(source)
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
     if video is None:
         raise Yt2BiliError("源文件里没有视频轨道。")
 
-    vcodec = (video.get("codec_name") or "").lower()
-    pix_fmt = (video.get("pix_fmt") or "").lower()
-    acodec = (audio.get("codec_name") or "").lower() if audio else ""
-    can_copy = (
-        source.suffix.lower() in {".mp4", ".m4v"}
-        and vcodec in {"h264", "avc1"}
-        and pix_fmt in {"yuv420p", "yuvj420p"}
-        and acodec in {"aac", "mp4a"}
-    )
-
-    if can_copy:
-        logger.info("视频已是 H.264 + AAC，仅封装为 MP4。")
-        _run_ffmpeg(
-            [
-                "-i",
-                str(source),
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(dest),
-            ]
-        )
+    logger.info("源文件不是 MP4（%s），正在转换为 MP4。", source.suffix)
+    cmd = [
+        "-i",
+        str(source),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-map",
+        "0:v:0",
+    ]
+    if audio:
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-map", "0:a:0"]
     else:
-        logger.info("正在转码为 B 站兼容的 H.264 + AAC MP4（可能较慢）。")
-        cmd = [
-            "-i",
-            str(source),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-map",
-            "0:v:0",
-        ]
-        if audio:
-            cmd += ["-c:a", "aac", "-b:a", "192k", "-map", "0:a:0"]
-        else:
-            logger.warning("源视频没有音轨，将只上传画面。")
-            cmd += ["-an"]
-        cmd.append(str(dest))
-        _run_ffmpeg(cmd)
+        logger.warning("源视频没有音轨，将只上传画面。")
+        cmd += ["-an"]
+    cmd.append(str(dest))
+    _run_ffmpeg(cmd)
 
     if not dest.is_file() or dest.stat().st_size <= 0:
         raise Yt2BiliError("转码后的视频文件无效。")
