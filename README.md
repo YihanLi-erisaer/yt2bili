@@ -94,7 +94,7 @@ python -m yt2bili renew
 | 上传线路 | `tx`（避开 Windows 上证书常失效的 bldsa） | `.env` 里 `BILI_LINE`，如 `bda2` / `qn` |
 | 标签 | `转载`（B 站投稿需要至少一个标签） | `.env` 里 `BILI_TAGS` |
 | 创作声明 | 内容无需标注（Web 投稿，不勾选自制禁转） | 固定 |
-| 分辨率 | yt-dlp 能下到的最高画质；已是 MP4 则不转码，其它格式再转成 MP4 | 无上限 |
+| 分辨率 | 源站最高可用画质（含 4K）。禁止嵌入的视频可能只能下到 1080p | 无上限 |
 | 时长 | 不限制 | — |
 | 并行下载 | 2 路（最大 8） | `-j` 或 `.env` 里 `DOWNLOAD_JOBS` |
 | 上传间隔 | 30 秒 | `.env` 里 `UPLOAD_GAP_SECONDS` |

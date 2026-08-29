@@ -89,6 +89,8 @@ def download_video(url: str, work_dir: Path, settings: Settings) -> Path:
         {
             "outtmpl": str(work_dir / "source.%(ext)s"),
             "format": "bv*+ba/b",
+            "format_sort": ["res", "fps", "hdr:12", "vcodec:av01", "vcodec:vp9", "br"],
+            "format_sort_force": True,
             "merge_output_format": "mp4",
             "noplaylist": True,
             "overwrites": False,
@@ -102,7 +104,8 @@ def download_video(url: str, work_dir: Path, settings: Settings) -> Path:
         try:
             logger.info("开始下载视频（第 %s/3 次）", attempt)
             with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
+                info = ydl.extract_info(url, download=True)
+            _log_selected_format(info)
             source = _find_source(work_dir)
             if source is None:
                 raise Yt2BiliError("下载完成但未找到视频文件。")
@@ -230,8 +233,8 @@ def _base_opts(settings: Settings) -> dict[str, Any]:
         "ignoreerrors": False,
         "extractor_args": {
             "youtube": {
-                # tv 客户端通常不触发网页端「确认你不是机器人」。
-                "player_client": ["tv", "web_safari"],
+                # tv/web_safari 常被限制在 1080p HLS；web_embedded 才能拿到 1440/2160 DASH。
+                "player_client": ["web_embedded", "tv", "web_safari"],
             }
         },
     }
@@ -252,6 +255,34 @@ def _base_opts(settings: Settings) -> dict[str, Any]:
             browser,
         )
     return opts
+
+
+def _log_selected_format(info: dict[str, Any] | None) -> None:
+    if not info:
+        return
+    requested = info.get("requested_formats")
+    items = requested if isinstance(requested, list) else [info]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        vcodec = item.get("vcodec")
+        if vcodec in (None, "none"):
+            continue
+        height = item.get("height")
+        logger.info(
+            "下载画质：%sp  format=%s  %s  %s",
+            height or "?",
+            item.get("format_id"),
+            vcodec,
+            item.get("ext"),
+        )
+        protocol = str(item.get("protocol") or "")
+        if isinstance(height, int) and height <= 1080 and "m3u8" in protocol:
+            logger.warning(
+                "当前选中的是 HLS %sp（通常最高 1080p）。"
+                "若网页能看 4K，该视频可能禁止嵌入，已无法拿到更高画质。",
+                height,
+            )
 
 
 def _js_runtimes(bin_dir: Path) -> dict[str, dict[str, str]]:
