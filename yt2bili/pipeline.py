@@ -147,7 +147,7 @@ def retry(
     if meta_path.is_file():
         meta = YoutubeMeta.load(meta_path)
     else:
-        meta = youtube.fetch_meta(task.url, settings.youtube_cookies)
+        meta = youtube.fetch_meta(task.url, settings)
 
     try:
         return _execute(settings, store, task, meta, work_dir, dry_run=dry_run)
@@ -175,7 +175,7 @@ def _run_one(
     force: bool,
     skip_if_submitted: bool,
 ) -> Task:
-    meta = youtube.fetch_meta(url, settings.youtube_cookies)
+    meta = youtube.fetch_meta(url, settings)
     _current.video_id = meta.video_id
     log_path: Path | None = None
     try:
@@ -245,7 +245,7 @@ def _execute(
     task.status = "downloading"
     store.upsert(task)
     if not _ok(video_path):
-        source = youtube.download_video(meta.webpage_url, work_dir, settings.youtube_cookies)
+        source = youtube.download_video(meta.webpage_url, work_dir, settings)
         media.ensure_bilibili_mp4(source, video_path)
     else:
         log.info("已存在 video.mp4，跳过下载/转码。")

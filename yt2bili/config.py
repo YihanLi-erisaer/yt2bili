@@ -16,6 +16,7 @@ class Settings:
     bili_cookies: Path
     biliup_bin: Path | None
     youtube_cookies: Path | None
+    youtube_cookies_from_browser: str | None
     bili_tid: int
     bili_tags: str
     bili_line: str
@@ -43,6 +44,13 @@ def load_settings() -> Settings:
         youtube_cookies = Path(yt_cookies_raw)
         if not youtube_cookies.is_absolute():
             youtube_cookies = ROOT / youtube_cookies
+    else:
+        default_yt_cookies = ROOT / "secrets" / "youtube_cookies.txt"
+        if default_yt_cookies.is_file():
+            youtube_cookies = default_yt_cookies
+
+    browser_raw = os.getenv("YOUTUBE_COOKIES_FROM_BROWSER", "").strip()
+    youtube_cookies_from_browser = browser_raw or None
 
     biliup_raw = os.getenv("BILIUP_BIN", "").strip()
     biliup_bin = Path(biliup_raw) if biliup_raw else None
@@ -68,6 +76,7 @@ def load_settings() -> Settings:
         bili_cookies=bili_cookies,
         biliup_bin=biliup_bin,
         youtube_cookies=youtube_cookies,
+        youtube_cookies_from_browser=youtube_cookies_from_browser,
         bili_tid=tid,
         bili_tags=tags,
         bili_line=line,

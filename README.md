@@ -99,11 +99,13 @@ python -m yt2bili renew
 | 并行下载 | 2 路（最大 8） | `-j` 或 `.env` 里 `DOWNLOAD_JOBS` |
 | 上传间隔 | 30 秒 | `.env` 里 `UPLOAD_GAP_SECONDS` |
 
-年龄限制等需要登录才能看的 YouTube 视频：从浏览器导出 Netscape 格式 cookies，放到例如 `secrets\youtube_cookies.txt`，并在 `.env` 中设置：
+YouTube 现在要求 JS 运行时才能完整解析。本机有 Node.js 或 Deno 即可（`setup` 会检测）。若出现「Sign in to confirm you’re not a bot」，先完全退出 Edge/Chrome，再导出 cookies：
 
+```powershell
+python -m yt2bili youtube-cookies
 ```
-YOUTUBE_COOKIES=secrets/youtube_cookies.txt
-```
+
+之后会自动使用 `secrets\youtube_cookies.txt`。也可以在 `.env` 里写 `YOUTUBE_COOKIES_FROM_BROWSER=edge`（每次下载前都要退出浏览器）。
 
 ## 流程
 

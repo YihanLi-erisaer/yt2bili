@@ -5,7 +5,7 @@ import logging
 import sys
 from pathlib import Path
 
-from yt2bili import bili_upload, pipeline
+from yt2bili import bili_upload, pipeline, youtube
 from yt2bili.config import load_settings
 from yt2bili.db import TaskStore
 from yt2bili.exceptions import Yt2BiliError
@@ -44,7 +44,15 @@ def _dispatch(args: argparse.Namespace, settings, store: TaskStore) -> int:
     if command == "setup":
         require_ffmpeg()
         path = bili_upload.setup_biliup(settings)
+        js = youtube.describe_js_runtimes(settings)
         logger.info("ffmpeg 与 biliup 已就绪：%s", path)
+        if js:
+            logger.info("YouTube JS 运行时：%s", js)
+        else:
+            logger.warning(
+                "未找到 Deno 或 Node.js，YouTube 解析可能被拦截。"
+                "请安装 https://nodejs.org 或把 deno.exe 放到 bin\\"
+            )
         logger.info("下一步：把 .env.example 复制为 .env，填入 DEEPL_AUTH_KEY，然后运行 python -m yt2bili login")
         return 0
     if command == "login":
@@ -52,6 +60,10 @@ def _dispatch(args: argparse.Namespace, settings, store: TaskStore) -> int:
         return 0
     if command == "renew":
         bili_upload.renew(settings)
+        return 0
+    if command == "youtube-cookies":
+        path = youtube.export_browser_cookies(settings, args.browser)
+        logger.info("以后下载会自动使用：%s", path)
         return 0
     if command == "list":
         tasks = store.list_all()
@@ -128,6 +140,16 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("login", help="B 站扫码登录，Cookie 写入 secrets/")
     sub.add_parser("renew", help="刷新 B 站登录态")
     sub.add_parser("list", help="列出本地任务")
+
+    yt_ck = sub.add_parser(
+        "youtube-cookies",
+        help="从已登录的浏览器导出 YouTube cookies（导出前请完全退出浏览器）",
+    )
+    yt_ck.add_argument(
+        "--browser",
+        default=None,
+        help="chrome / edge / firefox，默认按顺序尝试",
+    )
 
     run_p = sub.add_parser("run", help="处理一条或多条 YouTube 链接")
     run_p.add_argument("urls", nargs="*", help="YouTube 视频链接（可多条）")
