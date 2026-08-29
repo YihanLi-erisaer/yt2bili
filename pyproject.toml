@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yt2bili"
+version = "0.1.0"
+description = "Download a YouTube video you are allowed to reprint, translate with DeepL, and submit to Bilibili."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "yt-dlp>=2025.1.0",
+    "deepl>=1.18.0",
+    "python-dotenv>=1.0.0",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+yt2bili = "yt2bili.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["yt2bili*"]
