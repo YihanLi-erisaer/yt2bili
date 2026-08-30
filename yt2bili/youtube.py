@@ -25,6 +25,11 @@ _BOT_MARKERS = (
     "confirm you’re not a bot",
     "confirm you're not a bot",
 )
+_RANGE_MARKERS = (
+    "416",
+    "requested range not satisfiable",
+    "range not satisfiable",
+)
 
 
 @dataclass
@@ -117,6 +122,12 @@ def download_video(url: str, work_dir: Path, settings: Settings) -> Path:
         except Exception as exc:  # yt-dlp raises DownloadError
             last_error = exc
             logger.warning("下载失败：%s", exc)
+            if _is_range_error(exc):
+                _clear_partial_downloads(work_dir)
+                if attempt < 3:
+                    logger.warning("半成品和当前链接对不上（HTTP 416），已删除 .part，改为重新下载。")
+                    time.sleep(2)
+                    continue
             if _is_bot_block(exc) and attempt < 3:
                 wait = 15 * attempt
                 logger.warning("YouTube 机器人校验失败，%s 秒后重试。", wait)
@@ -314,6 +325,25 @@ def _parse_browser(raw: str) -> tuple[str, ...]:
     return (text.lower(),)
 
 
+def _is_range_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _RANGE_MARKERS)
+
+
+def _clear_partial_downloads(work_dir: Path) -> None:
+    removed = 0
+    for pattern in ("*.part", "*.ytdl"):
+        for path in work_dir.glob(pattern):
+            try:
+                path.unlink()
+                removed += 1
+                logger.info("已删除不完整下载：%s", path.name)
+            except OSError as exc:
+                logger.warning("删除 %s 失败：%s", path, exc)
+    if removed:
+        logger.info("已清理 %s 个半成品文件。", removed)
+
+
 def _is_bot_block(exc: BaseException) -> bool:
     text = str(exc).lower()
     return any(marker in text for marker in _BOT_MARKERS)
@@ -329,6 +359,11 @@ def _format_ytdlp_error(prefix: str, exc: BaseException | None) -> str:
             "1. 用 Edge 打开并登录 YouTube\n"
             "2. 安装 Get cookies.txt LOCALLY，在 youtube.com 导出 Netscape 格式\n"
             "3. 保存为 secrets/youtube_cookies.txt 后重新 run\n"
+            f"原始错误：{detail}"
+        )
+    if exc is not None and _is_range_error(exc):
+        return (
+            f"{prefix}：断点续传失败（HTTP 416）。半成品已无法接着下，请再 retry 一次从头下载。\n"
             f"原始错误：{detail}"
         )
     return (
