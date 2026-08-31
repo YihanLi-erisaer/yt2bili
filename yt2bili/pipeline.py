@@ -245,7 +245,12 @@ def _execute(
     task.status = "downloading"
     store.upsert(task)
     if not _ok(video_path):
-        source = youtube.download_video(meta.webpage_url, work_dir, settings)
+        source = youtube.download_video(
+            meta.webpage_url,
+            work_dir,
+            settings,
+            expected_duration=meta.duration,
+        )
         media.ensure_bilibili_mp4(source, video_path)
     else:
         log.info("已存在 video.mp4，跳过下载/转码。")

@@ -20,6 +20,97 @@ def require_ffmpeg() -> None:
         )
 
 
+def probe_brief(path: Path) -> dict | None:
+    if not path.is_file() or path.stat().st_size <= 0:
+        return None
+    require_ffmpeg()
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration,size",
+        "-show_entries",
+        "stream=codec_type,codec_name,width,height",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    data = json.loads(result.stdout or "{}")
+    streams = list(data.get("streams") or [])
+    fmt = data.get("format") or {}
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    duration = None
+    try:
+        duration = float(fmt.get("duration") or 0) or None
+    except (TypeError, ValueError):
+        duration = None
+    width = int(video["width"]) if video and video.get("width") else None
+    height = int(video["height"]) if video and video.get("height") else None
+    return {
+        "has_video": video is not None,
+        "has_audio": audio is not None,
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "vcodec": (video or {}).get("codec_name"),
+    }
+
+
+def duration_looks_complete(probed: float | None, expected: int | None) -> bool:
+    if probed is None or probed <= 1:
+        return False
+    if expected is None or expected <= 0:
+        return True
+    tolerance = max(2.0, expected * 0.02)
+    return abs(probed - expected) <= tolerance
+
+
+def mux_video_audio(video: Path, audio: Path, dest: Path) -> Path:
+    require_ffmpeg()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp.mp4")
+    tmp.unlink(missing_ok=True)
+    _run_ffmpeg(
+        [
+            "-i",
+            str(video),
+            "-i",
+            str(audio),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            str(tmp),
+        ]
+    )
+    if not tmp.is_file() or tmp.stat().st_size <= 0:
+        tmp.unlink(missing_ok=True)
+        raise Yt2BiliError("合并音视频失败。")
+    tmp.replace(dest)
+    return dest
+
+
 def ensure_bilibili_mp4(source: Path, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and dest.stat().st_size > 0:

@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 import yt_dlp
 
+from yt2bili import media
 from yt2bili.config import Settings
 from yt2bili.exceptions import Yt2BiliError
 
@@ -82,12 +83,16 @@ def fetch_meta(url: str, settings: Settings) -> YoutubeMeta:
     )
 
 
-def download_video(url: str, work_dir: Path, settings: Settings) -> Path:
+def download_video(
+    url: str,
+    work_dir: Path,
+    settings: Settings,
+    expected_duration: int | None = None,
+) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
-    existing = _find_source(work_dir)
-    if existing:
-        logger.info("已存在源视频，跳过下载：%s", existing)
-        return existing
+    finished = _finish_existing_source(url, work_dir, settings, expected_duration)
+    if finished:
+        return finished
 
     opts = _base_opts(settings)
     opts.update(
@@ -116,16 +121,22 @@ def download_video(url: str, work_dir: Path, settings: Settings) -> Path:
                 raise Yt2BiliError("下载完成但未找到视频文件。")
             if source.stat().st_size <= 0:
                 raise Yt2BiliError("下载的视频文件为空。")
-            return source
+            muxed = _ensure_has_audio(url, work_dir, settings, source, expected_duration)
+            return muxed
         except Yt2BiliError:
             raise
         except Exception as exc:  # yt-dlp raises DownloadError
             last_error = exc
             logger.warning("下载失败：%s", exc)
             if _is_range_error(exc):
-                _clear_partial_downloads(work_dir)
+                recovered = _recover_after_416(
+                    url, work_dir, settings, expected_duration
+                )
+                if recovered:
+                    return recovered
                 if attempt < 3:
-                    logger.warning("半成品和当前链接对不上（HTTP 416），已删除 .part，改为重新下载。")
+                    opts = {**opts, "continuedl": False, "overwrites": True}
+                    logger.warning("半成品无法续传（HTTP 416），将从头下载。")
                     time.sleep(2)
                     continue
             if _is_bot_block(exc) and attempt < 3:
@@ -135,6 +146,147 @@ def download_video(url: str, work_dir: Path, settings: Settings) -> Path:
                 continue
             time.sleep(2 ** attempt)
     raise Yt2BiliError(_format_ytdlp_error("视频下载失败", last_error))
+
+
+def _finish_existing_source(
+    url: str,
+    work_dir: Path,
+    settings: Settings,
+    expected_duration: int | None,
+) -> Path | None:
+    video = _best_complete_video(work_dir, expected_duration)
+    if video is None:
+        return None
+    return _ensure_has_audio(url, work_dir, settings, video, expected_duration)
+
+
+def _recover_after_416(
+    url: str,
+    work_dir: Path,
+    settings: Settings,
+    expected_duration: int | None,
+) -> Path | None:
+    video = _best_complete_video(work_dir, expected_duration, include_parts=True)
+    if video is None:
+        _clear_partial_downloads(work_dir)
+        return None
+    logger.info("416 续传失败，但本地画面已完整：%s", video.name)
+    try:
+        return _ensure_has_audio(url, work_dir, settings, video, expected_duration)
+    except Exception as exc:
+        logger.warning("补音频失败，将删除半成品后重下：%s", exc)
+        _clear_partial_downloads(work_dir)
+        return None
+
+
+def _best_complete_video(
+    work_dir: Path,
+    expected_duration: int | None,
+    *,
+    include_parts: bool = True,
+) -> Path | None:
+    candidates: list[Path] = []
+    for path in work_dir.glob("source.*"):
+        if path.suffix.lower() in {".json", ".jpg", ".jpeg", ".png", ".webp", ".vtt", ".srt", ".nfo"}:
+            continue
+        if path.name.endswith(".ytdl"):
+            continue
+        if path.suffix.lower() == ".part" or path.name.endswith(".mp4.part"):
+            if include_parts:
+                candidates.append(path)
+            continue
+        if path.suffix.lower() in _VIDEO_EXTS:
+            candidates.append(path)
+    best: tuple[float, Path] | None = None
+    for path in candidates:
+        if path.stat().st_size <= 0:
+            continue
+        info = media.probe_brief(path)
+        if not info or not info.get("has_video"):
+            continue
+        duration = info.get("duration")
+        if not media.duration_looks_complete(duration, expected_duration):
+            continue
+        score = float(duration or 0) + (1_000_000 if info.get("has_audio") else 0)
+        if best is None or score > best[0]:
+            best = (score, path)
+    if best is None:
+        return None
+    path = best[1]
+    if path.suffix.lower() == ".part" or path.name.endswith(".part"):
+        renamed = path.with_name(path.name.removesuffix(".part"))
+        if renamed.exists() and renamed.resolve() != path.resolve():
+            renamed.unlink()
+        path.replace(renamed)
+        logger.info("已将完整半成品改名为 %s", renamed.name)
+        return renamed
+    return path
+
+
+def _ensure_has_audio(
+    url: str,
+    work_dir: Path,
+    settings: Settings,
+    video: Path,
+    expected_duration: int | None,
+) -> Path:
+    dest = work_dir / "source.mp4"
+    info = media.probe_brief(video)
+    if info and info.get("has_audio") and info.get("has_video"):
+        logger.info("已存在带音轨的源视频：%s", video)
+        return video
+
+    logger.info("画面已完整但没有音轨，开始补下载音频。")
+    audio = _download_audio_only(url, work_dir, settings)
+    merged = media.mux_video_audio(video, audio, dest)
+    probe = media.probe_brief(merged)
+    if not probe or not probe.get("has_audio") or not probe.get("has_video"):
+        raise Yt2BiliError("合并后的视频缺少音轨或画面。")
+    if not media.duration_looks_complete(probe.get("duration"), expected_duration):
+        logger.warning(
+            "合并后时长 %.1fs，期望 %s 秒。",
+            probe.get("duration") or 0,
+            expected_duration,
+        )
+    logger.info("已合并音视频：%s", merged)
+    return merged
+
+
+def _download_audio_only(url: str, work_dir: Path, settings: Settings) -> Path:
+    existing = _find_audio(work_dir)
+    if existing:
+        logger.info("已存在音轨，跳过下载：%s", existing)
+        return existing
+    opts = _base_opts(settings)
+    opts.update(
+        {
+            "outtmpl": str(work_dir / "audio.%(ext)s"),
+            "format": "ba/bestaudio/b",
+            "noplaylist": True,
+            "overwrites": True,
+            "retries": 10,
+            "fragment_retries": 10,
+        }
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(url, download=True)
+    audio = _find_audio(work_dir)
+    if audio is None:
+        raise Yt2BiliError("音频下载完成但未找到音轨文件。")
+    return audio
+
+
+def _find_audio(work_dir: Path) -> Path | None:
+    found: list[Path] = []
+    for path in work_dir.glob("audio.*"):
+        if path.suffix.lower() in {".part", ".ytdl", ".json"}:
+            continue
+        if path.stat().st_size > 0:
+            found.append(path)
+    if not found:
+        return None
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return found[0]
 
 
 def download_thumbnail(url: str, dest: Path) -> None:
@@ -363,7 +515,7 @@ def _format_ytdlp_error(prefix: str, exc: BaseException | None) -> str:
         )
     if exc is not None and _is_range_error(exc):
         return (
-            f"{prefix}：断点续传失败（HTTP 416）。半成品已无法接着下，请再 retry 一次从头下载。\n"
+            f"{prefix}：断点续传失败（HTTP 416）。若画面已下完会自动补音频合并；否则会清掉半成品重下。\n"
             f"原始错误：{detail}"
         )
     return (
