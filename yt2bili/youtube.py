@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -30,6 +31,18 @@ _RANGE_MARKERS = (
     "416",
     "requested range not satisfiable",
     "range not satisfiable",
+)
+_FILE_LOCK_MARKERS = (
+    "winerror 32",
+    "being used by another process",
+    "unable to rename file",
+    "另一个程序正在使用此文件",
+    "进程无法访问",
+)
+_SSL_MARKERS = (
+    "ssl:",
+    "unexpected_eof_while_reading",
+    "eof occurred in violation of protocol",
 )
 
 
@@ -110,9 +123,14 @@ def download_video(
         }
     )
     last_error: Exception | None = None
-    for attempt in range(1, 4):
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        _finalize_part_files(work_dir)
+        finished = _finish_existing_source(url, work_dir, settings, expected_duration)
+        if finished:
+            return finished
         try:
-            logger.info("开始下载视频（第 %s/3 次）", attempt)
+            logger.info("开始下载视频（第 %s/%s 次）", attempt, max_attempts)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
             _log_selected_format(info)
@@ -128,23 +146,43 @@ def download_video(
         except Exception as exc:  # yt-dlp raises DownloadError
             last_error = exc
             logger.warning("下载失败：%s", exc)
+            if _is_file_lock_error(exc):
+                recovered = _recover_after_rename_failure(
+                    url, work_dir, settings, expected_duration
+                )
+                if recovered:
+                    return recovered
+                if attempt < max_attempts:
+                    wait = 3 * attempt
+                    logger.warning(
+                        "Windows 文件被占用（常见于杀毒扫描），%s 秒后重试。",
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
             if _is_range_error(exc):
                 recovered = _recover_after_416(
                     url, work_dir, settings, expected_duration
                 )
                 if recovered:
                     return recovered
-                if attempt < 3:
+                if attempt < max_attempts:
                     opts = {**opts, "continuedl": False, "overwrites": True}
                     logger.warning("半成品无法续传（HTTP 416），将从头下载。")
                     time.sleep(2)
                     continue
-            if _is_bot_block(exc) and attempt < 3:
+            if _is_ssl_error(exc) and attempt < max_attempts:
+                wait = 10 * attempt
+                logger.warning("网络 SSL 连接中断，%s 秒后重试。", wait)
+                time.sleep(wait)
+                continue
+            if _is_bot_block(exc) and attempt < max_attempts:
                 wait = 15 * attempt
                 logger.warning("YouTube 机器人校验失败，%s 秒后重试。", wait)
                 time.sleep(wait)
                 continue
-            time.sleep(2 ** attempt)
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
     raise Yt2BiliError(_format_ytdlp_error("视频下载失败", last_error))
 
 
@@ -158,6 +196,60 @@ def _finish_existing_source(
     if video is None:
         return None
     return _ensure_has_audio(url, work_dir, settings, video, expected_duration)
+
+
+def _recover_after_rename_failure(
+    url: str,
+    work_dir: Path,
+    settings: Settings,
+    expected_duration: int | None,
+) -> Path | None:
+    if not _finalize_part_files(work_dir):
+        return None
+    source = _find_source(work_dir)
+    if source is None:
+        return None
+    logger.info("重命名失败后已从本地文件恢复：%s", source.name)
+    try:
+        return _ensure_has_audio(url, work_dir, settings, source, expected_duration)
+    except Exception as exc:
+        logger.warning("恢复后的文件无法继续处理：%s", exc)
+        return None
+
+
+def _finalize_part_files(work_dir: Path) -> bool:
+    changed = False
+    for path in sorted(work_dir.glob("*.part")):
+        dest = path.with_name(path.name.removesuffix(".part"))
+        if dest.exists() and dest.stat().st_size >= path.stat().st_size:
+            path.unlink(missing_ok=True)
+            changed = True
+            continue
+        if _rename_with_retry(path, dest):
+            logger.info("已手动完成重命名：%s -> %s", path.name, dest.name)
+            changed = True
+    return changed
+
+
+def _rename_with_retry(
+    src: Path,
+    dest: Path,
+    *,
+    attempts: int = 5,
+    delay: float = 2.0,
+) -> bool:
+    for i in range(attempts):
+        try:
+            if dest.exists():
+                dest.unlink()
+            src.replace(dest)
+            return True
+        except OSError as exc:
+            if i + 1 == attempts:
+                logger.warning("重命名 %s 失败：%s", src.name, exc)
+                return False
+            time.sleep(delay * (i + 1))
+    return False
 
 
 def _recover_after_416(
@@ -215,9 +307,8 @@ def _best_complete_video(
     path = best[1]
     if path.suffix.lower() == ".part" or path.name.endswith(".part"):
         renamed = path.with_name(path.name.removesuffix(".part"))
-        if renamed.exists() and renamed.resolve() != path.resolve():
-            renamed.unlink()
-        path.replace(renamed)
+        if not _rename_with_retry(path, renamed):
+            return None
         logger.info("已将完整半成品改名为 %s", renamed.name)
         return renamed
     return path
@@ -404,6 +495,10 @@ def _base_opts(settings: Settings) -> dict[str, Any]:
     if runtimes:
         opts["js_runtimes"] = runtimes
 
+    if sys.platform == "win32":
+        # Parallel fragment writes + AV scanning often cause WinError 32 on rename.
+        opts["concurrent_fragment_downloads"] = 1
+
     cookie_file = settings.youtube_cookies
     browser = settings.youtube_cookies_from_browser
     if cookie_file:
@@ -482,6 +577,16 @@ def _is_range_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _RANGE_MARKERS)
 
 
+def _is_file_lock_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _FILE_LOCK_MARKERS)
+
+
+def _is_ssl_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _SSL_MARKERS)
+
+
 def _clear_partial_downloads(work_dir: Path) -> None:
     removed = 0
     for pattern in ("*.part", "*.ytdl"):
@@ -516,6 +621,18 @@ def _format_ytdlp_error(prefix: str, exc: BaseException | None) -> str:
     if exc is not None and _is_range_error(exc):
         return (
             f"{prefix}：断点续传失败（HTTP 416）。若画面已下完会自动补音频合并；否则会清掉半成品重下。\n"
+            f"原始错误：{detail}"
+        )
+    if exc is not None and _is_file_lock_error(exc):
+        return (
+            f"{prefix}：Windows 上文件被占用，通常是并行下载或杀毒软件扫描导致。\n"
+            "可稍等后用 retry 续跑；若反复出现可在 .env 设置 DOWNLOAD_JOBS=1。\n"
+            f"原始错误：{detail}"
+        )
+    if exc is not None and _is_ssl_error(exc):
+        return (
+            f"{prefix}：下载过程中网络 SSL 连接中断（常见于大文件或网络不稳定）。\n"
+            "请用 retry 续传；若仍失败可减小并行数（DOWNLOAD_JOBS=1）或换网络后再试。\n"
             f"原始错误：{detail}"
         )
     return (

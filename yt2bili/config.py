@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,7 +60,9 @@ def load_settings() -> Settings:
     tid = int(os.getenv("BILI_TID", "171"))
     # Auto-probe often picks bldsa, whose CDN cert currently fails rustls on Windows.
     line = os.getenv("BILI_LINE", "tx").strip() or "tx"
-    download_jobs = _env_int("DOWNLOAD_JOBS", 2, lo=1, hi=8)
+    # Windows: parallel large downloads often hit WinError 32 on .part rename.
+    default_jobs = 1 if sys.platform == "win32" else 2
+    download_jobs = _env_int("DOWNLOAD_JOBS", default_jobs, lo=1, hi=8)
     upload_gap_seconds = _env_int("UPLOAD_GAP_SECONDS", 30, lo=0, hi=600)
 
     work_dir = ROOT / "work"

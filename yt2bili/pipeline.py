@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +23,8 @@ NOTICE = (
 
 _translate_lock = threading.Lock()
 _upload_lock = threading.Lock()
+# On Windows, parallel yt-dlp writes often trigger WinError 32 during .part rename.
+_download_lock = threading.Lock() if sys.platform == "win32" else None
 _last_upload_monotonic = 0.0
 _current = threading.local()
 MAX_DOWNLOAD_JOBS = 8
@@ -84,10 +87,14 @@ def run_many(
 
     workers = jobs if jobs is not None else settings.download_jobs
     workers = max(1, min(workers, MAX_DOWNLOAD_JOBS, len(unique)))
+    # More pipeline threads than download workers so one task can upload while
+    # another downloads (download itself stays serialized on Windows via lock).
+    pipeline_workers = min(len(unique), max(workers, 2))
     logger.info(
-        "批量 %s 条：并行下载 %s 路，B 站上传排队（间隔 %s 秒）。",
+        "批量 %s 条：YouTube 下载最多 %s 路并行，流水线 %s 路（上传排队，间隔 %s 秒）。",
         len(unique),
         workers,
+        pipeline_workers,
         settings.upload_gap_seconds,
     )
 
@@ -104,7 +111,7 @@ def run_many(
             skip_if_submitted=True,
         )
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=pipeline_workers) as pool:
         future_map = {pool.submit(worker, url): url for url in unique}
         for future in as_completed(future_map):
             url = future_map[future]
@@ -245,12 +252,21 @@ def _execute(
     task.status = "downloading"
     store.upsert(task)
     if not _ok(video_path):
-        source = youtube.download_video(
-            meta.webpage_url,
-            work_dir,
-            settings,
-            expected_duration=meta.duration,
-        )
+        if _download_lock is not None:
+            with _download_lock:
+                source = youtube.download_video(
+                    meta.webpage_url,
+                    work_dir,
+                    settings,
+                    expected_duration=meta.duration,
+                )
+        else:
+            source = youtube.download_video(
+                meta.webpage_url,
+                work_dir,
+                settings,
+                expected_duration=meta.duration,
+            )
         media.ensure_bilibili_mp4(source, video_path)
     else:
         log.info("已存在 video.mp4，跳过下载/转码。")
