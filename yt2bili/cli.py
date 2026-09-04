@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    raw = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(_protect_retry_video_id(raw))
 
     logging.basicConfig(
         level=logging.INFO,
@@ -179,9 +180,40 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     retry_p = sub.add_parser("retry", help="从失败步骤继续某个 video_id")
-    retry_p.add_argument("video_id", help="YouTube 视频 ID")
+    retry_p.add_argument(
+        "video_id",
+        help="YouTube 视频 ID（以 - 开头时也可直接写，如 retry -GiIT0fNvW8）",
+    )
     retry_p.add_argument("--dry-run", action="store_true", help="续跑但不上传")
     return parser
+
+
+def _protect_retry_video_id(argv: list[str]) -> list[str]:
+    """Keep YouTube IDs that start with '-' from being parsed as flags."""
+    if "retry" not in argv:
+        return argv
+    idx = argv.index("retry")
+    rest = argv[idx + 1 :]
+    if "--" in rest:
+        return argv
+    flags = {"-h", "--help", "--dry-run"}
+    video_id: str | None = None
+    options: list[str] = []
+    extras: list[str] = []
+    for token in rest:
+        if token in flags:
+            options.append(token)
+        elif video_id is None:
+            video_id = token
+        else:
+            extras.append(token)
+    out = argv[:idx] + ["retry"] + options
+    if video_id is not None:
+        if video_id.startswith("-"):
+            out.append("--")
+        out.append(video_id)
+    out.extend(extras)
+    return out
 
 
 def _read_url_file(path: str) -> list[str]:

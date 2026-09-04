@@ -77,6 +77,8 @@ python -m yt2bili run --file urls.txt
 python -m yt2bili retry VIDEO_ID
 ```
 
+video_id 以 `-` 开头时也可以直接写，例如 `python -m yt2bili retry -GiIT0fNvW8`。
+
 其它命令：
 
 ```powershell
