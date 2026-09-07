@@ -146,14 +146,15 @@ def download_video(
         except Exception as exc:  # yt-dlp raises DownloadError
             last_error = exc
             logger.warning("下载失败：%s", exc)
+            recovered = _finish_existing_source(
+                url, work_dir, settings, expected_duration
+            )
+            if recovered:
+                logger.info("本地下载已完整，跳过失败的收尾步骤。")
+                return recovered
             if _is_file_lock_error(exc):
-                recovered = _recover_after_rename_failure(
-                    url, work_dir, settings, expected_duration
-                )
-                if recovered:
-                    return recovered
                 if attempt < max_attempts:
-                    wait = 3 * attempt
+                    wait = 5 * attempt
                     logger.warning(
                         "Windows 文件被占用（常见于杀毒扫描），%s 秒后重试。",
                         wait,
@@ -198,25 +199,6 @@ def _finish_existing_source(
     return _ensure_has_audio(url, work_dir, settings, video, expected_duration)
 
 
-def _recover_after_rename_failure(
-    url: str,
-    work_dir: Path,
-    settings: Settings,
-    expected_duration: int | None,
-) -> Path | None:
-    if not _finalize_part_files(work_dir):
-        return None
-    source = _find_source(work_dir)
-    if source is None:
-        return None
-    logger.info("重命名失败后已从本地文件恢复：%s", source.name)
-    try:
-        return _ensure_has_audio(url, work_dir, settings, source, expected_duration)
-    except Exception as exc:
-        logger.warning("恢复后的文件无法继续处理：%s", exc)
-        return None
-
-
 def _finalize_part_files(work_dir: Path) -> bool:
     changed = False
     for path in sorted(work_dir.glob("*.part")):
@@ -246,8 +228,19 @@ def _rename_with_retry(
             return True
         except OSError as exc:
             if i + 1 == attempts:
-                logger.warning("重命名 %s 失败：%s", src.name, exc)
-                return False
+                try:
+                    shutil.copyfile(src, dest)
+                    try:
+                        src.unlink()
+                    except OSError:
+                        logger.warning(
+                            "已复制 %s，但原 .part 仍被占用，稍后可手动删除。",
+                            dest.name,
+                        )
+                    return True
+                except OSError as copy_exc:
+                    logger.warning("重命名 %s 失败：%s；复制也失败：%s", src.name, exc, copy_exc)
+                    return False
             time.sleep(delay * (i + 1))
     return False
 
@@ -307,10 +300,11 @@ def _best_complete_video(
     path = best[1]
     if path.suffix.lower() == ".part" or path.name.endswith(".part"):
         renamed = path.with_name(path.name.removesuffix(".part"))
-        if not _rename_with_retry(path, renamed):
-            return None
-        logger.info("已将完整半成品改名为 %s", renamed.name)
-        return renamed
+        if _rename_with_retry(path, renamed):
+            logger.info("已将完整半成品改名为 %s", renamed.name)
+            return renamed
+        logger.warning("无法去掉 .part 后缀，将直接使用：%s", path.name)
+        return path
     return path
 
 
@@ -357,14 +351,37 @@ def _download_audio_only(url: str, work_dir: Path, settings: Settings) -> Path:
             "overwrites": True,
             "retries": 10,
             "fragment_retries": 10,
+            "extractor_retries": 5,
         }
     )
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
-    audio = _find_audio(work_dir)
-    if audio is None:
-        raise Yt2BiliError("音频下载完成但未找到音轨文件。")
-    return audio
+    last_error: Exception | None = None
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        existing = _find_audio(work_dir)
+        if existing:
+            logger.info("已存在音轨，跳过下载：%s", existing)
+            return existing
+        try:
+            logger.info("开始下载音轨（第 %s/%s 次）", attempt, max_attempts)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+            audio = _find_audio(work_dir)
+            if audio is None:
+                raise Yt2BiliError("音频下载完成但未找到音轨文件。")
+            return audio
+        except Yt2BiliError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning("音轨下载失败：%s", exc)
+            if _is_ssl_error(exc) and attempt < max_attempts:
+                wait = 10 * attempt
+                logger.warning("网络 SSL 连接中断，%s 秒后重试音轨下载。", wait)
+                time.sleep(wait)
+                continue
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+    raise Yt2BiliError(_format_ytdlp_error("音轨下载失败", last_error))
 
 
 def _find_audio(work_dir: Path) -> Path | None:
@@ -485,6 +502,10 @@ def _base_opts(settings: Settings) -> dict[str, Any]:
         "no_warnings": False,
         "noplaylist": True,
         "ignoreerrors": False,
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 5,
+        "socket_timeout": 30,
         "extractor_args": {
             "youtube": {
                 # tv/web_safari 常被限制在 1080p HLS；web_embedded 才能拿到 1440/2160 DASH。

@@ -120,7 +120,7 @@ def ensure_bilibili_mp4(source: Path, dest: Path) -> Path:
     if not source.is_file() or source.stat().st_size <= 0:
         raise Yt2BiliError(f"源视频无效：{source}")
 
-    if source.suffix.lower() == ".mp4":
+    if source.suffix.lower() == ".mp4" or source.name.lower().endswith(".mp4.part"):
         if source.resolve() != dest.resolve():
             logger.info("源文件已是 MP4，跳过转换：%s", source)
             shutil.copy2(source, dest)
