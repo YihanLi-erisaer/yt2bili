@@ -117,6 +117,11 @@ def _dispatch(args: argparse.Namespace, settings, store: TaskStore) -> int:
         )
         _print_result(task, args.dry_run)
         return 0
+    if command == "repair":
+        for video_id in args.video_ids:
+            path = pipeline.repair(settings, store, video_id, redownload=args.redownload, encoder=args.encoder, max_size_gb=args.max_size_gb)
+            logger.info("修复完成（未上传）：%s", path)
+        return 0
     raise Yt2BiliError(f"未知命令：{command}")
 
 
@@ -185,6 +190,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="YouTube 视频 ID（以 - 开头时也可直接写，如 retry -GiIT0fNvW8）",
     )
     retry_p.add_argument("--dry-run", action="store_true", help="续跑但不上传")
+    repair_p = sub.add_parser("repair", help="修复本地投稿文件，不重复投稿；可用于已提交但平台转码失败的任务")
+    repair_p.add_argument("video_ids", nargs="+", help="一个或多个已有任务的 YouTube 视频 ID")
+    repair_p.add_argument("--redownload", action="store_true", help="保留旧文件到 rejected/，重新下载完整源文件")
+    repair_p.add_argument("--encoder", choices=("libx264", "h264_nvenc"), default="libx264", help="仅非 MP4 转换时使用；完整 MP4 直接复用，不转码")
+    repair_p.add_argument("--max-size-gb", type=float, default=None, help="文件大小上限（十进制 GB）；MP4 超限则报错，不自动压缩，非 MP4 转换时限制码率")
     return parser
 
 

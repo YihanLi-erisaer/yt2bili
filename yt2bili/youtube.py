@@ -4,7 +4,10 @@ import json
 import logging
 import shutil
 import sys
+import threading
 import time
+import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -14,13 +17,41 @@ import yt_dlp
 
 from yt2bili import media
 from yt2bili.config import Settings
-from yt2bili.exceptions import Yt2BiliError
+from yt2bili.exceptions import InvalidMediaError, Yt2BiliError
 
 logger = logging.getLogger(__name__)
 
 _VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi", ".m4v"}
 _SKIP_EXTS = {".json", ".jpg", ".jpeg", ".png", ".webp", ".vtt", ".srt", ".nfo", ".part"}
 _js_runtime_logged = False
+_download_lock = threading.Lock() if sys.platform == "win32" else None
+_download_context = threading.local()
+
+
+@contextmanager
+def download_slots(gate):
+    """Share a batch's download budget without holding it during validation."""
+    previous = getattr(_download_context, "gate", None)
+    _download_context.gate = gate
+    try:
+        yield
+    finally:
+        _download_context.gate = previous
+
+
+def _download_with_slot(opts: dict, url: str) -> dict:
+    gate = getattr(_download_context, "gate", None)
+    logger.info("等待下载名额：%s", url)
+    # Include yt-dlp merging, renaming and cookie writes in the critical section.
+    # Validation, cache checks and retry backoff must remain outside it.
+    with gate if gate is not None else nullcontext():
+        with _download_lock if _download_lock is not None else nullcontext():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                result = ydl.extract_info(url, download=True)
+    logger.info("下载/合并阶段结束，已释放下载名额：%s", url)
+    return result
+
+
 _BOT_MARKERS = (
     "sign in to confirm",
     "not a bot",
@@ -120,19 +151,18 @@ def download_video(
             "retries": 10,
             "fragment_retries": 10,
             "extractor_retries": 3,
+            "skip_unavailable_fragments": False,
         }
     )
     last_error: Exception | None = None
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
-        _finalize_part_files(work_dir)
         finished = _finish_existing_source(url, work_dir, settings, expected_duration)
         if finished:
             return finished
         try:
             logger.info("开始下载视频（第 %s/%s 次）", attempt, max_attempts)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            info = _download_with_slot(opts, url)
             _log_selected_format(info)
             source = _find_source(work_dir)
             if source is None:
@@ -141,6 +171,14 @@ def download_video(
                 raise Yt2BiliError("下载的视频文件为空。")
             muxed = _ensure_has_audio(url, work_dir, settings, source, expected_duration)
             return muxed
+        except InvalidMediaError as exc:
+            last_error = exc
+            logger.warning("下载文件校验失败，将隔离并重新下载：%s", exc)
+            for path in list(work_dir.glob("source.*")) + list(work_dir.glob("audio.*")):
+                if path.is_file():
+                    quarantine_file(path)
+            if attempt == max_attempts:
+                raise
         except Yt2BiliError:
             raise
         except Exception as exc:  # yt-dlp raises DownloadError
@@ -196,53 +234,25 @@ def _finish_existing_source(
     video = _best_complete_video(work_dir, expected_duration)
     if video is None:
         return None
-    return _ensure_has_audio(url, work_dir, settings, video, expected_duration)
+    try:
+        return _ensure_has_audio(url, work_dir, settings, video, expected_duration)
+    except InvalidMediaError as exc:
+        logger.warning("本地媒体校验失败：%s", exc)
+        quarantine_file(video)
+        for path in work_dir.glob("audio.*"):
+            if path.is_file():
+                quarantine_file(path)
+        return None
 
 
-def _finalize_part_files(work_dir: Path) -> bool:
-    changed = False
-    for path in sorted(work_dir.glob("*.part")):
-        dest = path.with_name(path.name.removesuffix(".part"))
-        if dest.exists() and dest.stat().st_size >= path.stat().st_size:
-            path.unlink(missing_ok=True)
-            changed = True
-            continue
-        if _rename_with_retry(path, dest):
-            logger.info("已手动完成重命名：%s -> %s", path.name, dest.name)
-            changed = True
-    return changed
-
-
-def _rename_with_retry(
-    src: Path,
-    dest: Path,
-    *,
-    attempts: int = 5,
-    delay: float = 2.0,
-) -> bool:
-    for i in range(attempts):
-        try:
-            if dest.exists():
-                dest.unlink()
-            src.replace(dest)
-            return True
-        except OSError as exc:
-            if i + 1 == attempts:
-                try:
-                    shutil.copyfile(src, dest)
-                    try:
-                        src.unlink()
-                    except OSError:
-                        logger.warning(
-                            "已复制 %s，但原 .part 仍被占用，稍后可手动删除。",
-                            dest.name,
-                        )
-                    return True
-                except OSError as copy_exc:
-                    logger.warning("重命名 %s 失败：%s；复制也失败：%s", src.name, exc, copy_exc)
-                    return False
-            time.sleep(delay * (i + 1))
-    return False
+def quarantine_file(path: Path) -> Path:
+    """Preserve rejected downloads outside the reusable source glob."""
+    folder = path.parent / "rejected" / uuid.uuid4().hex[:12]
+    folder.mkdir(parents=True)
+    dest = folder / path.name
+    path.replace(dest)
+    logger.warning("已隔离旧文件，可从此路径恢复：%s", dest)
+    return dest
 
 
 def _recover_after_416(
@@ -251,7 +261,7 @@ def _recover_after_416(
     settings: Settings,
     expected_duration: int | None,
 ) -> Path | None:
-    video = _best_complete_video(work_dir, expected_duration, include_parts=True)
+    video = _best_complete_video(work_dir, expected_duration)
     if video is None:
         _clear_partial_downloads(work_dir)
         return None
@@ -259,7 +269,7 @@ def _recover_after_416(
     try:
         return _ensure_has_audio(url, work_dir, settings, video, expected_duration)
     except Exception as exc:
-        logger.warning("补音频失败，将删除半成品后重下：%s", exc)
+        logger.warning("补音频失败，将隔离半成品后重下：%s", exc)
         _clear_partial_downloads(work_dir)
         return None
 
@@ -267,18 +277,15 @@ def _recover_after_416(
 def _best_complete_video(
     work_dir: Path,
     expected_duration: int | None,
-    *,
-    include_parts: bool = True,
 ) -> Path | None:
     candidates: list[Path] = []
     for path in work_dir.glob("source.*"):
         if path.suffix.lower() in {".json", ".jpg", ".jpeg", ".png", ".webp", ".vtt", ".srt", ".nfo"}:
             continue
-        if path.name.endswith(".ytdl"):
+        if path.name.endswith(".ytdl") or ".tmp." in path.name:
             continue
         if path.suffix.lower() == ".part" or path.name.endswith(".mp4.part"):
-            if include_parts:
-                candidates.append(path)
+            # Only yt-dlp knows whether a .part download has finished.
             continue
         if path.suffix.lower() in _VIDEO_EXTS:
             candidates.append(path)
@@ -286,26 +293,19 @@ def _best_complete_video(
     for path in candidates:
         if path.stat().st_size <= 0:
             continue
-        info = media.probe_brief(path)
-        if not info or not info.get("has_video"):
+        try:
+            info = media.validate_media(path, expected_duration, require_audio=False)
+        except InvalidMediaError as exc:
+            logger.warning("不复用无效源文件：%s", exc)
+            quarantine_file(path)
             continue
         duration = info.get("duration")
-        if not media.duration_looks_complete(duration, expected_duration):
-            continue
         score = float(duration or 0) + (1_000_000 if info.get("has_audio") else 0)
         if best is None or score > best[0]:
             best = (score, path)
     if best is None:
         return None
-    path = best[1]
-    if path.suffix.lower() == ".part" or path.name.endswith(".part"):
-        renamed = path.with_name(path.name.removesuffix(".part"))
-        if _rename_with_retry(path, renamed):
-            logger.info("已将完整半成品改名为 %s", renamed.name)
-            return renamed
-        logger.warning("无法去掉 .part 后缀，将直接使用：%s", path.name)
-        return path
-    return path
+    return best[1]
 
 
 def _ensure_has_audio(
@@ -316,23 +316,14 @@ def _ensure_has_audio(
     expected_duration: int | None,
 ) -> Path:
     dest = work_dir / "source.mp4"
-    info = media.probe_brief(video)
+    info = media.validate_media(video, expected_duration, require_audio=False)
     if info and info.get("has_audio") and info.get("has_video"):
         logger.info("已存在带音轨的源视频：%s", video)
         return video
 
     logger.info("画面已完整但没有音轨，开始补下载音频。")
     audio = _download_audio_only(url, work_dir, settings)
-    merged = media.mux_video_audio(video, audio, dest)
-    probe = media.probe_brief(merged)
-    if not probe or not probe.get("has_audio") or not probe.get("has_video"):
-        raise Yt2BiliError("合并后的视频缺少音轨或画面。")
-    if not media.duration_looks_complete(probe.get("duration"), expected_duration):
-        logger.warning(
-            "合并后时长 %.1fs，期望 %s 秒。",
-            probe.get("duration") or 0,
-            expected_duration,
-        )
+    merged = media.mux_video_audio(video, audio, dest, expected_duration)
     logger.info("已合并音视频：%s", merged)
     return merged
 
@@ -363,8 +354,7 @@ def _download_audio_only(url: str, work_dir: Path, settings: Settings) -> Path:
             return existing
         try:
             logger.info("开始下载音轨（第 %s/%s 次）", attempt, max_attempts)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
+            _download_with_slot(opts, url)
             audio = _find_audio(work_dir)
             if audio is None:
                 raise Yt2BiliError("音频下载完成但未找到音轨文件。")
@@ -499,9 +489,11 @@ def _base_opts(settings: Settings) -> dict[str, Any]:
 
     opts: dict[str, Any] = {
         "quiet": False,
+        "progress_delta": 2,
         "no_warnings": False,
         "noplaylist": True,
         "ignoreerrors": False,
+        "skip_unavailable_fragments": False,
         "retries": 10,
         "fragment_retries": 10,
         "extractor_retries": 5,
@@ -515,6 +507,9 @@ def _base_opts(settings: Settings) -> dict[str, Any]:
     }
     if runtimes:
         opts["js_runtimes"] = runtimes
+    ffmpeg = Path(media.ffmpeg_tool("ffmpeg"))
+    if ffmpeg.is_file():
+        opts["ffmpeg_location"] = str(ffmpeg.parent)
 
     if sys.platform == "win32":
         # Parallel fragment writes + AV scanning often cause WinError 32 on rename.
@@ -613,11 +608,11 @@ def _clear_partial_downloads(work_dir: Path) -> None:
     for pattern in ("*.part", "*.ytdl"):
         for path in work_dir.glob(pattern):
             try:
-                path.unlink()
+                quarantine_file(path)
                 removed += 1
-                logger.info("已删除不完整下载：%s", path.name)
+                logger.info("已隔离不完整下载：%s", path.name)
             except OSError as exc:
-                logger.warning("删除 %s 失败：%s", path, exc)
+                logger.warning("隔离 %s 失败：%s", path, exc)
     if removed:
         logger.info("已清理 %s 个半成品文件。", removed)
 
@@ -641,7 +636,7 @@ def _format_ytdlp_error(prefix: str, exc: BaseException | None) -> str:
         )
     if exc is not None and _is_range_error(exc):
         return (
-            f"{prefix}：断点续传失败（HTTP 416）。若画面已下完会自动补音频合并；否则会清掉半成品重下。\n"
+            f"{prefix}：断点续传失败（HTTP 416）。已完成的源文件通过校验后才会补音频；半成品会保留到 rejected/ 后重下。\n"
             f"原始错误：{detail}"
         )
     if exc is not None and _is_file_lock_error(exc):
@@ -684,7 +679,7 @@ def _best_thumbnail(info: dict[str, Any]) -> str:
 def _find_source(work_dir: Path) -> Path | None:
     found: list[Path] = []
     for path in work_dir.glob("source.*"):
-        if path.suffix.lower() in _SKIP_EXTS:
+        if path.suffix.lower() in _SKIP_EXTS or ".tmp." in path.name:
             continue
         if path.suffix.lower() in _VIDEO_EXTS and path.stat().st_size > 0:
             found.append(path)

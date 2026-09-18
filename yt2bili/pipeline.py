@@ -11,7 +11,7 @@ from pathlib import Path
 from yt2bili import bili_upload, media, translate, youtube
 from yt2bili.config import Settings
 from yt2bili.db import Task, TaskStore
-from yt2bili.exceptions import Yt2BiliError
+from yt2bili.exceptions import InvalidMediaError, Yt2BiliError
 from yt2bili.youtube import YoutubeMeta
 
 logger = logging.getLogger(__name__)
@@ -23,8 +23,6 @@ NOTICE = (
 
 _translate_lock = threading.Lock()
 _upload_lock = threading.Lock()
-# On Windows, parallel yt-dlp writes often trigger WinError 32 during .part rename.
-_download_lock = threading.Lock() if sys.platform == "win32" else None
 _last_upload_monotonic = 0.0
 _current = threading.local()
 MAX_DOWNLOAD_JOBS = 8
@@ -87,11 +85,14 @@ def run_many(
 
     workers = jobs if jobs is not None else settings.download_jobs
     workers = max(1, min(workers, MAX_DOWNLOAD_JOBS, len(unique)))
-    # More pipeline threads than download workers so one task can upload while
-    # another downloads (download itself stays serialized on Windows via lock).
-    pipeline_workers = min(len(unique), max(workers, 2))
+    if sys.platform == "win32":
+        workers = 1
+    # One extra task can validate/process/upload while download slots are busy.
+    # This bounded queue also avoids downloading an entire batch ahead of uploads.
+    pipeline_workers = min(len(unique), workers + 1)
+    download_gate = threading.BoundedSemaphore(workers)
     logger.info(
-        "批量 %s 条：YouTube 下载最多 %s 路并行，流水线 %s 路（上传排队，间隔 %s 秒）。",
+        "批量 %s 条：下载最多 %s 路，流水线 %s 路；校验不占下载名额（上传排队，间隔 %s 秒）。",
         len(unique),
         workers,
         pipeline_workers,
@@ -102,14 +103,15 @@ def run_many(
     failures: list[tuple[str, str]] = []
 
     def worker(url: str) -> Task:
-        return _run_one(
-            settings,
-            store,
-            url,
-            dry_run=dry_run,
-            force=force,
-            skip_if_submitted=True,
-        )
+        with youtube.download_slots(download_gate):
+            return _run_one(
+                settings,
+                store,
+                url,
+                dry_run=dry_run,
+                force=force,
+                skip_if_submitted=True,
+            )
 
     with ThreadPoolExecutor(max_workers=pipeline_workers) as pool:
         future_map = {pool.submit(worker, url): url for url in unique}
@@ -171,6 +173,42 @@ def retry(
     finally:
         _detach_file_handler(log_path, video_id)
         _current.video_id = None
+
+
+def repair(
+    settings: Settings, store: TaskStore, video_id: str, *, redownload: bool = False,
+    encoder: str = "libx264",
+    max_size_gb: float | None = None,
+) -> Path:
+    """Prepare a replacement file without publishing a duplicate Bilibili post."""
+    media.require_ffmpeg()
+    task = store.require(video_id)
+    work_dir = settings.work_dir / video_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    # Resolve metadata first so network errors do not disturb local files.
+    meta = youtube.fetch_meta(task.url, settings)
+    meta.save(work_dir / "meta.json")
+    video_path = work_dir / "video.mp4"
+    result = None
+    if redownload:
+        for path in list(work_dir.glob("source.*")) + list(work_dir.glob("audio.*")) + [video_path]:
+            if path.is_file():
+                youtube.quarantine_file(path)
+    elif _ok(video_path):
+        try:
+            result = media.prepare_upload_video(video_path, video_path, meta.duration, encoder=encoder, max_size_gb=max_size_gb)
+        except InvalidMediaError as exc:
+            logger.warning("旧文件不可复用：%s", exc)
+            youtube.quarantine_file(video_path)
+    if result is None:
+        source = youtube.download_video(meta.webpage_url, work_dir, settings, expected_duration=meta.duration)
+        result = media.prepare_upload_video(source, video_path, meta.duration, encoder=encoder, max_size_gb=max_size_gb)
+    # Preserve the existing submitted status/BV; upload acceptance is not transcode success.
+    task.work_dir = str(work_dir)
+    task.video_path = str(result)
+    store.upsert(task)
+    logger.info("已准备并校验替换文件：%s；原稿件 %s，请在创作中心替换视频。", result, task.bv_id)
+    return result
 
 
 def _run_one(
@@ -251,25 +289,24 @@ def _execute(
     video_path = work_dir / "video.mp4"
     task.status = "downloading"
     store.upsert(task)
-    if not _ok(video_path):
-        if _download_lock is not None:
-            with _download_lock:
-                source = youtube.download_video(
-                    meta.webpage_url,
-                    work_dir,
-                    settings,
-                    expected_duration=meta.duration,
-                )
-        else:
-            source = youtube.download_video(
-                meta.webpage_url,
-                work_dir,
-                settings,
-                expected_duration=meta.duration,
-            )
-        media.ensure_bilibili_mp4(source, video_path)
+    ready = False
+    if _ok(video_path):
+        try:
+            video_path = media.prepare_upload_video(video_path, video_path, meta.duration)
+            ready = True
+        except InvalidMediaError as exc:
+            log.warning("旧投稿文件不完整，准备重新下载：%s", exc)
+            youtube.quarantine_file(video_path)
+    if not ready:
+        source = youtube.download_video(
+            meta.webpage_url,
+            work_dir,
+            settings,
+            expected_duration=meta.duration,
+        )
+        video_path = media.prepare_upload_video(source, video_path, meta.duration)
     else:
-        log.info("已存在 video.mp4，跳过下载/转码。")
+        log.info("已有 video.mp4 通过校验。")
     task.video_path = str(video_path)
     store.upsert(task)
 
@@ -353,11 +390,15 @@ def _execute(
     task.status = "submitted"
     task.error = ""
     store.upsert(task)
-    _cleanup_uploaded_files(settings, work_dir)
-    task.work_dir = ""
-    task.video_path = ""
-    task.cover_path = ""
-    store.upsert(task)
+    if bv:
+        _cleanup_uploaded_files(settings, work_dir)
+        if not work_dir.exists():
+            task.work_dir = ""
+            task.video_path = ""
+            task.cover_path = ""
+            store.upsert(task)
+    else:
+        log.warning("上传命令退出成功，但未获取到 BV 号，暂不删除本地文件：%s", work_dir)
     log.info("完成。投稿成功不等于已过审。")
     return task
 
