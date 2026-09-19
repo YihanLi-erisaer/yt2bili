@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import shutil
-import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from yt2bili import bili_upload, media, translate, youtube
@@ -25,7 +26,110 @@ _translate_lock = threading.Lock()
 _upload_lock = threading.Lock()
 _last_upload_monotonic = 0.0
 _current = threading.local()
-MAX_DOWNLOAD_JOBS = 8
+MAX_MEDIA_ATTEMPTS = 5
+
+
+@dataclass
+class _PipelineJob:
+    url: str
+    task: Task | None = None
+    meta: YoutubeMeta | None = None
+    work_dir: Path | None = None
+    source: Path | None = None
+    attempts: int = 0
+    skipped: bool = False
+
+
+@contextmanager
+def _job_context(job: _PipelineJob):
+    assert job.task is not None and job.work_dir is not None
+    previous = getattr(_current, "video_id", None)
+    _current.video_id = job.task.video_id
+    log_path = job.work_dir / "pipeline.log"
+    _attach_file_handler(log_path, job.task.video_id)
+    try:
+        yield
+    finally:
+        _detach_file_handler(log_path, job.task.video_id)
+        _current.video_id = previous
+
+
+def _download_job(settings, store, job: _PipelineJob, force: bool, seen_ids: set[str]):
+    if job.task is None:
+        meta = youtube.fetch_meta(job.url, settings)
+        if meta.video_id in seen_ids:
+            job.skipped = True
+            logger.info("同一视频的重复链接已跳过：%s", job.url)
+            return
+        seen_ids.add(meta.video_id)
+        existing = store.get(meta.video_id)
+        job.meta = meta
+        job.work_dir = settings.work_dir / meta.video_id
+        if existing and existing.status == "submitted" and not force:
+            job.task = existing
+            job.skipped = True
+            logger.info("跳过已投稿成功的 %s（%s）", meta.video_id, existing.bv_id)
+            return
+        if force and job.work_dir.exists():
+            _remove_work_dir(settings.work_dir, job.work_dir)
+            if job.work_dir.exists():
+                raise Yt2BiliError(f"无法清理强制重做的任务目录：{job.work_dir}")
+        job.work_dir.mkdir(parents=True, exist_ok=True)
+        job.task = existing if existing and not force else Task(meta.video_id, meta.webpage_url, "pending")
+        job.task.url = meta.webpage_url
+        job.task.work_dir = str(job.work_dir)
+        job.task.title_orig = meta.title
+        job.task.desc_orig = meta.description
+        job.task.uploader = meta.uploader
+        meta.save(job.work_dir / "meta.json")
+    assert job.task is not None and job.meta is not None and job.work_dir is not None
+    with _job_context(job):
+        job.attempts += 1
+        job.task.status = "downloading"
+        job.task.error = ""
+        store.upsert(job.task)
+        video = job.work_dir / "video.mp4"
+        # Existing outputs are only candidates: the validation worker is the gatekeeper.
+        job.source = video if _ok(video) else youtube.download_video(
+            job.meta.webpage_url, job.work_dir, settings,
+            expected_duration=job.meta.duration, validate=False,
+        )
+        job.task.status = "queued_validation"
+        store.upsert(job.task)
+        logger.info("[%s] 下载阶段完成，已进入校验队列。", job.task.video_id)
+
+
+def _validate_job(settings, store, job: _PipelineJob):
+    assert job.task is not None and job.meta is not None and job.work_dir is not None and job.source is not None
+    with _job_context(job):
+        job.task.status = "validating"
+        store.upsert(job.task)
+        video = media.prepare_upload_video(job.source, job.work_dir / "video.mp4", job.meta.duration)
+        job.task.video_path = str(video)
+        store.upsert(job.task)
+        job.task.status = "queued_upload"
+        store.upsert(job.task)
+        logger.info("[%s] 校验完成，已进入上传队列。", job.task.video_id)
+
+
+def _upload_job(settings, store, job: _PipelineJob, dry_run: bool):
+    assert job.task is not None and job.meta is not None and job.work_dir is not None
+    with _job_context(job):
+        # Covers/translation must not hold up the next video's validation.
+        _prepare_assets(settings, store, job.task, job.meta, job.work_dir, Path(job.task.video_path))
+        return _submit_ready(settings, store, job.task, job.meta, job.work_dir, dry_run=dry_run)
+
+
+def _reject_job_source(job: _PipelineJob):
+    assert job.work_dir is not None and job.source is not None
+    if job.source == job.work_dir / "video.mp4":
+        candidates = [job.source]
+    else:
+        candidates = list(job.work_dir.glob("source.*")) + list(job.work_dir.glob("audio.*"))
+    for path in candidates:
+        if path.is_file():
+            youtube.quarantine_file(path)
+    job.source = None
 
 
 class VideoIdLogFilter(logging.Filter):
@@ -83,48 +187,69 @@ def run_many(
     if not unique:
         raise Yt2BiliError("没有要处理的链接。")
 
-    workers = jobs if jobs is not None else settings.download_jobs
-    workers = max(1, min(workers, MAX_DOWNLOAD_JOBS, len(unique)))
-    if sys.platform == "win32":
-        workers = 1
-    # One extra task can validate/process/upload while download slots are busy.
-    # This bounded queue also avoids downloading an entire batch ahead of uploads.
-    pipeline_workers = min(len(unique), workers + 1)
-    download_gate = threading.BoundedSemaphore(workers)
-    logger.info(
-        "批量 %s 条：下载最多 %s 路，流水线 %s 路；校验不占下载名额（上传排队，间隔 %s 秒）。",
-        len(unique),
-        workers,
-        pipeline_workers,
-        settings.upload_gap_seconds,
-    )
+    if jobs not in (None, 1):
+        logger.info("三队列模式固定每阶段单路，忽略旧的 -j %s 参数。", jobs)
+    logger.info("批量 %s 条：下载、校验处理、上传三个独立单路队列；上传间隔 %s 秒。",
+                len(unique), settings.upload_gap_seconds)
 
     results: list[Task] = []
     failures: list[tuple[str, str]] = []
 
-    def worker(url: str) -> Task:
-        with youtube.download_slots(download_gate):
-            return _run_one(
-                settings,
-                store,
-                url,
-                dry_run=dry_run,
-                force=force,
-                skip_if_submitted=True,
-            )
+    seen_ids: set[str] = set()  # accessed only by the single download worker
+    pools = {stage: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"yt2bili-{stage}")
+             for stage in ("download", "validate", "upload")}
+    pending = {}
 
-    with ThreadPoolExecutor(max_workers=pipeline_workers) as pool:
-        future_map = {pool.submit(worker, url): url for url in unique}
-        for future in as_completed(future_map):
-            url = future_map[future]
-            try:
-                results.append(future.result())
-            except Yt2BiliError as exc:
-                logger.error("%s 失败：%s", url, exc)
-                failures.append((url, str(exc)))
-            except Exception as exc:
-                logger.exception("%s 未预期错误", url)
-                failures.append((url, f"未预期错误：{exc}"))
+    def enqueue(stage, job):
+        if stage == "download":
+            future = pools[stage].submit(_download_job, settings, store, job, force, seen_ids)
+        elif stage == "validate":
+            future = pools[stage].submit(_validate_job, settings, store, job)
+        else:
+            future = pools[stage].submit(_upload_job, settings, store, job, dry_run)
+        pending[future] = (stage, job)
+
+    try:
+        for url in unique:
+            enqueue("download", _PipelineJob(url))
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in [item for item in pending if item in done]:
+                stage, job = pending.pop(future)
+                try:
+                    future.result()
+                    if job.skipped:
+                        if job.task is not None:
+                            results.append(job.task)
+                    elif stage == "download":
+                        enqueue("validate", job)
+                    elif stage == "validate":
+                        enqueue("upload", job)
+                    else:
+                        results.append(job.task)
+                except Exception as exc:
+                    if stage == "validate" and isinstance(exc, InvalidMediaError) and job.attempts < MAX_MEDIA_ATTEMPTS:
+                        try:
+                            _reject_job_source(job)
+                            job.task.status = "queued_download"
+                            store.upsert(job.task)
+                            logger.warning("[%s] 校验失败，退回下载队列（%s/%s）：%s",
+                                           job.task.video_id, job.attempts, MAX_MEDIA_ATTEMPTS, exc)
+                            enqueue("download", job)
+                            continue
+                        except Exception as recovery_error:
+                            exc = recovery_error
+                    logger.error("%s 在 %s 阶段失败：%s", job.url, stage, exc)
+                    if job.task is not None:
+                        job.task.status = "failed"
+                        job.task.error = str(exc)
+                        store.upsert(job.task)
+                    failures.append((job.url, str(exc)))
+    finally:
+        for future in pending:
+            future.cancel()
+        for pool in pools.values():
+            pool.shutdown(wait=True, cancel_futures=True)
 
     logger.info(
         "批量结束：成功 %s，失败 %s。",
@@ -310,6 +435,14 @@ def _execute(
     task.video_path = str(video_path)
     store.upsert(task)
 
+    _prepare_assets(settings, store, task, meta, work_dir, video_path)
+    return _submit_ready(settings, store, task, meta, work_dir, dry_run=dry_run)
+
+
+def _prepare_assets(settings, store, task, meta, work_dir: Path, video_path: Path) -> None:
+    """Prepare submission assets, outside the batch's download/validation queues."""
+    log = logging.getLogger(f"yt2bili.task.{task.video_id}")
+
     cover_path = work_dir / "cover.jpg"
     task.status = "processing_cover"
     store.upsert(task)
@@ -369,6 +502,11 @@ def _execute(
     log.info("中文标题：%s", task.title_zh)
     log.info("简介预览：\n%s", task.desc_zh)
 
+
+def _submit_ready(settings, store, task, meta, work_dir: Path, *, dry_run: bool) -> Task:
+    log = logging.getLogger(f"yt2bili.task.{task.video_id}")
+    video_path = Path(task.video_path)
+    cover_path = Path(task.cover_path)
     if dry_run:
         task.status = "ready"
         log.info("dry-run：已跳过 B 站上传。")

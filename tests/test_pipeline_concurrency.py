@@ -39,8 +39,8 @@ class PipelineConcurrencyTests(unittest.TestCase):
                 validating.wait(5)
             return youtube.YoutubeMeta(url, url, "title", "desc", "author", 10, "thumb", None, url)
 
-        def validate(url, work, settings, source, duration):
-            if url == "first":
+        def validate(source, dest, duration):
+            if source.parent.name == "first":
                 validating.set()
                 overlapped.append(next_download.wait(5))
             return source
@@ -55,16 +55,15 @@ class PipelineConcurrencyTests(unittest.TestCase):
                     work.mkdir(parents=True)
                     (work / "cover.jpg").write_bytes(b"cover")
                     store.upsert(Task(video_id, video_id, "pending", title_zh="title", desc_zh="desc"))
-                with patch.object(pipeline.sys, "platform", "win32"), \
-                     patch.object(youtube, "_download_lock", threading.Lock()), \
+                with patch.object(youtube, "_download_lock", threading.Lock()), \
                      patch.object(media, "require_ffmpeg"), \
                      patch.object(youtube, "fetch_meta", side_effect=meta), \
                      patch.object(youtube, "_base_opts", return_value={}), \
-                     patch.object(youtube, "_finish_existing_source", return_value=None), \
+                     patch.object(youtube, "_finish_existing_source", return_value=None) as old_probe, \
                      patch.object(youtube, "_log_selected_format"), \
                      patch.object(youtube.yt_dlp, "YoutubeDL", Downloader), \
-                     patch.object(youtube, "_ensure_has_audio", side_effect=validate), \
-                     patch.object(media, "prepare_upload_video", side_effect=lambda source, *a: source), \
+                     patch.object(youtube, "_ensure_has_audio") as old_validation, \
+                     patch.object(media, "prepare_upload_video", side_effect=validate), \
                      patch.object(pipeline, "_upload_serialized") as upload:
                     results, failures = pipeline.run_many(settings, store, ["first", "second"], dry_run=True, jobs=1)
                 self.assertEqual(overlapped, [True], "next download was blocked by the first validation")
@@ -72,8 +71,44 @@ class PipelineConcurrencyTests(unittest.TestCase):
                 self.assertEqual(len(results), 2)
                 self.assertTrue(all(task.status == "ready" for task in results))
                 upload.assert_not_called()
+                old_validation.assert_not_called()
+                old_probe.assert_not_called()
             finally:
                 store.close()
+
+    def test_unchecked_existing_source_never_decodes_in_download_stage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source.mp4"
+            source.write_bytes(b"not yet validated")
+            with patch.object(media, "validate_media") as validate:
+                self.assertEqual(youtube.download_video("url", root, None, 10, validate=False), source)
+                validate.assert_not_called()
+
+    def test_unchecked_416_retry_preserves_parts_without_decoding(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            part = root / "source.mp4.part"
+            part.write_bytes(b"partial")
+            attempts = []
+
+            def transfer(opts, url):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise RuntimeError("HTTP Error 416")
+                (root / "source.mp4").write_bytes(b"new source")
+                return {}
+
+            with patch.object(youtube, "_base_opts", return_value={}), \
+                 patch.object(youtube, "_download_with_slot", side_effect=transfer), \
+                 patch.object(youtube, "_log_selected_format"), \
+                 patch.object(youtube.time, "sleep"), \
+                 patch.object(media, "validate_media") as validate:
+                result = youtube.download_video("url", root, None, 10, validate=False)
+            self.assertEqual(result, root / "source.mp4")
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(next((root / "rejected").rglob("source.mp4.part")).read_bytes(), b"partial")
+            validate.assert_not_called()
 
     def test_download_slot_is_released_on_error(self):
         gate = threading.BoundedSemaphore(1)

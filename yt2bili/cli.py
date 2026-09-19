@@ -171,7 +171,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="N",
-        help="同时下载的路数（默认 2，最大 8）。上传始终排队，不会并行投稿",
+        help="兼容旧参数；当前下载、校验、上传三个队列均固定单路，此参数不再增加并发",
     )
     run_p.add_argument(
         "--dry-run",

@@ -132,9 +132,11 @@ def download_video(
     work_dir: Path,
     settings: Settings,
     expected_duration: int | None = None,
+    *,
+    validate: bool = True,
 ) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
-    finished = _finish_existing_source(url, work_dir, settings, expected_duration)
+    finished = _finish_existing_source(url, work_dir, settings, expected_duration) if validate else _find_source(work_dir)
     if finished:
         return finished
 
@@ -157,7 +159,7 @@ def download_video(
     last_error: Exception | None = None
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
-        finished = _finish_existing_source(url, work_dir, settings, expected_duration)
+        finished = _finish_existing_source(url, work_dir, settings, expected_duration) if validate else _find_source(work_dir)
         if finished:
             return finished
         try:
@@ -169,8 +171,10 @@ def download_video(
                 raise Yt2BiliError("下载完成但未找到视频文件。")
             if source.stat().st_size <= 0:
                 raise Yt2BiliError("下载的视频文件为空。")
-            muxed = _ensure_has_audio(url, work_dir, settings, source, expected_duration)
-            return muxed
+            if not validate:
+                logger.info("下载完成，等待独立校验队列：%s", source)
+                return source
+            return _ensure_has_audio(url, work_dir, settings, source, expected_duration)
         except InvalidMediaError as exc:
             last_error = exc
             logger.warning("下载文件校验失败，将隔离并重新下载：%s", exc)
@@ -186,7 +190,7 @@ def download_video(
             logger.warning("下载失败：%s", exc)
             recovered = _finish_existing_source(
                 url, work_dir, settings, expected_duration
-            )
+            ) if validate else None
             if recovered:
                 logger.info("本地下载已完整，跳过失败的收尾步骤。")
                 return recovered
@@ -202,7 +206,9 @@ def download_video(
             if _is_range_error(exc):
                 recovered = _recover_after_416(
                     url, work_dir, settings, expected_duration
-                )
+                ) if validate else None
+                if not validate:
+                    _clear_partial_downloads(work_dir)
                 if recovered:
                     return recovered
                 if attempt < max_attempts:
