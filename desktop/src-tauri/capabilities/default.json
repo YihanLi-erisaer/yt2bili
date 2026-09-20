@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Local desktop window: dialogs and permitted external links only.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://www.bilibili.com/*" },
+        { "url": "https://member.bilibili.com/*" },
+        { "url": "https://stardazz-com.vercel.app/*" }
+      ]
+    }
+  ]
+}

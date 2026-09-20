@@ -24,7 +24,7 @@ class Settings:
     data_dir: Path
     bin_dir: Path
     download_jobs: int = 1
-    upload_gap_seconds: int = 5
+    upload_gap_seconds: int = 20
     desc_limit: int = 2000
     title_limit: int = 80
     cover_width: int = 1280

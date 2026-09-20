@@ -14,6 +14,8 @@ from pathlib import Path
 from PIL import Image
 
 from yt2bili.exceptions import InvalidMediaError, Yt2BiliError
+from yt2bili import events, process_manager
+from yt2bili.tools import find_tool
 
 logger = logging.getLogger(__name__)
 _validated: dict[tuple, dict] = {}
@@ -21,8 +23,7 @@ _VALIDATION_VERSION = 1
 
 
 def ffmpeg_tool(name: str) -> str:
-    local = Path(__file__).resolve().parent.parent / "bin" / (name + ".exe")
-    return str(local) if local.is_file() else (shutil.which(name) or name)
+    return find_tool(name)
 
 
 def require_ffmpeg() -> None:
@@ -64,6 +65,7 @@ def probe_brief(path: Path) -> dict | None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **process_manager.creation_options(),
         )
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -131,6 +133,8 @@ def _validation_fingerprint(path: Path, expected_duration) -> dict:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            events.check_cancelled()
+            events.progress("hashing", percent=None)
             digest.update(chunk)
     tool_states = []
     for name in ("ffmpeg", "ffprobe"):
@@ -183,6 +187,8 @@ def _decode_track(path: Path, stream: str, expected, acceleration: list[str]) ->
     backend = "GPU" if acceleration else "CPU"
 
     def report(actual: float) -> None:
+        events.progress("validating", percent=min(100, actual / expected * 100) if expected else None,
+                        track=stream, seconds=actual, backend=backend)
         percent = f"{min(100.0, actual / expected * 100):.1f}%" if expected else "未知总时长"
         logger.info("校验进度 [%s] %s %s %s：%.1f / %s 秒（%s）",
                     path.parent.name, path.name, stream, backend, actual, expected or "?", percent)
@@ -193,7 +199,9 @@ def _decode_track(path: Path, stream: str, expected, acceleration: list[str]) ->
         "-progress", "pipe:1", "-stats_period", "5", "-nostats", "-f", "null", "-",
     ]
     with tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, text=True, encoding="utf-8", errors="replace")
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, text=True, encoding="utf-8", errors="replace", **process_manager.creation_options())
+        watcher = process_manager.watch(process)
+        watcher.__enter__()
         actual = 0.0
         last_report = time.monotonic()
         try:
@@ -210,6 +218,7 @@ def _decode_track(path: Path, stream: str, expected, acceleration: list[str]) ->
                     last_report = time.monotonic()
             returncode = process.wait()
         finally:
+            watcher.__exit__(None, None, None)
             if process.poll() is None:
                 process.kill()
                 process.wait()
@@ -217,6 +226,7 @@ def _decode_track(path: Path, stream: str, expected, acceleration: list[str]) ->
                 process.stdout.close()
         errors.seek(0)
         detail = errors.read(4000).decode("utf-8", errors="replace").strip()
+    events.check_cancelled()
     if returncode or detail:
         raise InvalidMediaError(f"{path.name} 的 {stream} 解码失败：{detail or returncode}")
     if not duration_looks_complete(actual, expected):
@@ -456,6 +466,6 @@ def _center_crop_16x9(image: Image.Image) -> Image.Image:
 
 def _run_ffmpeg(args: list[str]) -> None:
     cmd = [ffmpeg_tool("ffmpeg"), "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-stats", *args]
-    result = subprocess.run(cmd)
+    result = process_manager.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode != 0:
         raise Yt2BiliError("ffmpeg 失败，请查看上方输出。")

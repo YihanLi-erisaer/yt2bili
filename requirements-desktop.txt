@@ -1,0 +1,5 @@
+-r requirements.txt
+keyring>=25,<26
+qrcode[pil]>=8,<9
+pyinstaller>=6,<7
+

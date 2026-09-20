@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 from yt2bili.config import Settings
 from yt2bili.exceptions import Yt2BiliError
+from yt2bili import process_manager
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +38,17 @@ def find_biliup(settings: Settings) -> Path:
             return path
         raise Yt2BiliError(f"BILIUP_BIN 指向的文件不存在：{path}")
 
-    for name in ("biliup.exe", "biliup"):
-        found = shutil.which(name)
-        if found:
-            return Path(found)
-
     for candidate in (
         settings.bin_dir / "biliup.exe",
         settings.bin_dir / "biliup",
     ):
         if candidate.is_file():
             return candidate
+
+    for name in ("biliup.exe", "biliup"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
 
     raise Yt2BiliError(
         "未找到 biliup 命令行工具。\n"
@@ -92,7 +93,7 @@ def renew(settings: Settings) -> None:
     biliup = find_biliup(settings)
     _require_cookies(settings)
     cmd = [str(biliup), "-u", str(settings.bili_cookies), "renew"]
-    result = subprocess.run(
+    result = process_manager.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     if result.returncode != 0:
@@ -199,11 +200,12 @@ def _run_logged(cmd: list[str]) -> tuple[int, str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        **process_manager.creation_options(),
     )
     chunks: list[str] = []
     assert process.stdout is not None
     for line in process.stdout:
-        print(line, end="")
+        logger.info("%s", line.rstrip())
         chunks.append(line)
     return process.wait(), "".join(chunks)
 

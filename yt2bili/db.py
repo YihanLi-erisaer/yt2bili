@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +24,10 @@ STATUSES = (
     "uploading",
     "submitted",
     "failed",
+    "cancel_requested",
+    "cancelled",
+    "interrupted",
+    "submission_unknown",
 )
 
 
@@ -45,11 +51,19 @@ class Task:
 
 
 class TaskStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, on_change=None) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self.on_change = on_change
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > 1:
+            self._conn.close()
+            raise Yt2BiliError("数据库版本高于当前程序，请使用更新版本。")
+        if version == 0 and db_path.stat().st_size:
+            with closing(sqlite3.connect(str(db_path) + ".pre-desktop.bak")) as backup:
+                self._conn.backup(backup)
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -72,6 +86,10 @@ class TaskStore:
             """
         )
         self._conn.commit()
+        with self._conn:
+            self._conn.execute("CREATE TABLE IF NOT EXISTS desktop_jobs (video_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            self._conn.execute("CREATE TABLE IF NOT EXISTS desktop_operations (id TEXT PRIMARY KEY, method TEXT NOT NULL, result TEXT NOT NULL)")
+            self._conn.execute("PRAGMA user_version=1")
 
     def get(self, video_id: str) -> Task | None:
         with self._lock:
@@ -137,6 +155,29 @@ class TaskStore:
                 ),
             )
             self._conn.commit()
+        if self.on_change:
+            self.on_change("task.status", asdict(task))
+
+    def save_job(self, video_id: str, payload: dict) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("INSERT OR REPLACE INTO desktop_jobs VALUES (?, ?)",
+                               (video_id, json.dumps(payload, ensure_ascii=False)))
+
+    def get_job(self, video_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT payload FROM desktop_jobs WHERE video_id=?", (video_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def operation(self, operation_id: str, method: str, result=None):
+        with self._lock, self._conn:
+            if result is not None:
+                self._conn.execute("INSERT INTO desktop_operations VALUES (?, ?, ?)",
+                                   (operation_id, method, json.dumps(result)))
+                return result
+            row = self._conn.execute("SELECT method, result FROM desktop_operations WHERE id=?", (operation_id,)).fetchone()
+            if row and row[0] != method:
+                raise Yt2BiliError("操作 ID 已用于另一种请求。")
+            return json.loads(row[1]) if row else None
 
     def require(self, video_id: str) -> Task:
         task = self.get(video_id)

@@ -1,0 +1,69 @@
+import { test, expect } from "@playwright/test";
+
+test("first-run guide starts with storage selection", async ({ page }) => {
+  await page.goto("/?preview");
+  await page.getByRole("button", { name: "开始配置" }).click();
+  await expect(page.getByRole("dialog")).toContainText("欢迎使用 yt2bili");
+  await expect(page.getByLabel("素材工作目录")).toHaveValue(/work/);
+  await expect(page.getByRole("dialog")).toContainText("运行环境");
+  await page.getByRole("button", { name: "关闭对话框" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("empty workspace, preview default, and modal keyboard focus", async ({
+  page,
+}) => {
+  await page.goto("/?preview");
+  await expect(page.getByText("你的下一条视频，从这里开始")).toBeVisible();
+  await page.getByRole("button", { name: /新建任务/ }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("radio").first()).toBeChecked();
+  await expect(dialog.getByRole("button", { name: "加入队列" })).toBeDisabled();
+  await dialog.getByRole("textbox").fill("https://youtu.be/abcdefghijk");
+  await dialog.getByRole("checkbox").check();
+  await dialog.getByRole("button", { name: "加入队列" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("界面预览");
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+});
+
+test("task preview preserves unsaved edits and gates submission", async ({
+  page,
+}) => {
+  await page.goto("/?preview&populated");
+  await page.getByRole("button", { name: /用更少的工具/ }).click();
+  const dialog = page.getByRole("dialog");
+  const title = dialog.getByLabel(/中文标题/);
+  await title.fill("手动编辑的标题");
+  await page.waitForTimeout(1700);
+  await expect(title).toHaveValue("手动编辑的标题");
+  await expect(
+    dialog.getByRole("button", { name: "确认投稿", exact: true }),
+  ).toBeDisabled();
+  await dialog.getByRole("button", { name: "保存修改" }).click();
+  await expect(
+    dialog.getByRole("button", { name: "确认投稿", exact: true }),
+  ).toBeEnabled();
+});
+
+test("settings theme and 1024px layout", async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 680 });
+  await page.goto("/?preview");
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page.getByRole("button", { name: "浅色", exact: true }).click();
+  await page.getByRole("button", { name: "保存设置", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth > innerWidth,
+  );
+  expect(overflow).toBe(false);
+});
+
+test("production-style unconnected page never pretends to perform work", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByText("未连接到后台")).toBeVisible();
+  await expect(page.getByRole("button", { name: /新建任务/ })).toBeDisabled();
+});

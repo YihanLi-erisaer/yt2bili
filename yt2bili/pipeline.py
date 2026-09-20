@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
+from functools import wraps
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from yt2bili.config import Settings
 from yt2bili.db import Task, TaskStore
 from yt2bili.exceptions import InvalidMediaError, Yt2BiliError
 from yt2bili.youtube import YoutubeMeta
+from yt2bili import events
+from yt2bili.locking import upload_guard, work_lock
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ class _PipelineJob:
     source: Path | None = None
     attempts: int = 0
     skipped: bool = False
+    lock: object = None
 
 
 @contextmanager
@@ -65,11 +69,14 @@ def _download_job(settings, store, job: _PipelineJob, force: bool, seen_ids: set
         existing = store.get(meta.video_id)
         job.meta = meta
         job.work_dir = settings.work_dir / meta.video_id
-        if existing and existing.status == "submitted" and not force:
+        if existing and existing.status in ("submitted", "submission_unknown") and not force:
             job.task = existing
             job.skipped = True
             logger.info("跳过已投稿成功的 %s（%s）", meta.video_id, existing.bv_id)
             return
+        if events.current_video_id() is None:
+            job.lock = work_lock(job.work_dir)
+            job.lock.__enter__()
         if force and job.work_dir.exists():
             _remove_work_dir(settings.work_dir, job.work_dir)
             if job.work_dir.exists():
@@ -199,6 +206,7 @@ def run_many(
     pools = {stage: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"yt2bili-{stage}")
              for stage in ("download", "validate", "upload")}
     pending = {}
+    batch_jobs = []
 
     def enqueue(stage, job):
         if stage == "download":
@@ -211,7 +219,9 @@ def run_many(
 
     try:
         for url in unique:
-            enqueue("download", _PipelineJob(url))
+            job = _PipelineJob(url)
+            batch_jobs.append(job)
+            enqueue("download", job)
         while pending:
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in [item for item in pending if item in done]:
@@ -241,7 +251,8 @@ def run_many(
                             exc = recovery_error
                     logger.error("%s 在 %s 阶段失败：%s", job.url, stage, exc)
                     if job.task is not None:
-                        job.task.status = "failed"
+                        if job.task.status != "submission_unknown":
+                            job.task.status = "failed"
                         job.task.error = str(exc)
                         store.upsert(job.task)
                     failures.append((job.url, str(exc)))
@@ -250,6 +261,9 @@ def run_many(
             future.cancel()
         for pool in pools.values():
             pool.shutdown(wait=True, cancel_futures=True)
+        for job in batch_jobs:
+            if job.lock:
+                job.lock.__exit__(None, None, None)
 
     logger.info(
         "批量结束：成功 %s，失败 %s。",
@@ -259,6 +273,17 @@ def run_many(
     return results, failures
 
 
+def _lock_existing_task(function):
+    @wraps(function)
+    def wrapped(settings, store, video_id, *args, **kwargs):
+        task = store.require(video_id)
+        folder = Path(task.work_dir) if task.work_dir else settings.work_dir / video_id
+        with work_lock(folder):
+            return function(settings, store, video_id, *args, **kwargs)
+    return wrapped
+
+
+@_lock_existing_task
 def retry(
     settings: Settings,
     store: TaskStore,
@@ -268,7 +293,9 @@ def retry(
 ) -> Task:
     media.require_ffmpeg()
     task = store.require(video_id)
-    if task.status == "submitted":
+    if task.status == "submission_unknown":
+        raise Yt2BiliError(f"{video_id} 的投稿结果待核对，请先核对创作中心，不能直接重试。")
+    if task.status in ("submitted", "submission_unknown"):
         raise Yt2BiliError(f"{video_id} 已经投稿成功，无需 retry。若要重做请用 run --force。")
 
     _current.video_id = video_id
@@ -286,12 +313,14 @@ def retry(
     try:
         return _execute(settings, store, task, meta, work_dir, dry_run=dry_run)
     except Yt2BiliError as exc:
-        task.status = "failed"
+        if task.status != "submission_unknown":
+            task.status = "failed"
         task.error = str(exc)
         store.upsert(task)
         raise
     except Exception as exc:
-        task.status = "failed"
+        if task.status != "submission_unknown":
+            task.status = "failed"
         task.error = f"未预期错误：{exc}"
         store.upsert(task)
         raise Yt2BiliError(task.error) from exc
@@ -300,6 +329,7 @@ def retry(
         _current.video_id = None
 
 
+@_lock_existing_task
 def repair(
     settings: Settings, store: TaskStore, video_id: str, *, redownload: bool = False,
     encoder: str = "libx264",
@@ -308,7 +338,7 @@ def repair(
     """Prepare a replacement file without publishing a duplicate Bilibili post."""
     media.require_ffmpeg()
     task = store.require(video_id)
-    work_dir = settings.work_dir / video_id
+    work_dir = Path(task.work_dir) if task.work_dir else settings.work_dir / video_id
     work_dir.mkdir(parents=True, exist_ok=True)
     # Resolve metadata first so network errors do not disturb local files.
     meta = youtube.fetch_meta(task.url, settings)
@@ -346,11 +376,13 @@ def _run_one(
     skip_if_submitted: bool,
 ) -> Task:
     meta = youtube.fetch_meta(url, settings)
+    task_lock = work_lock(settings.work_dir / meta.video_id)
+    task_lock.__enter__()
     _current.video_id = meta.video_id
     log_path: Path | None = None
     try:
         existing = store.get(meta.video_id)
-        if existing and existing.status == "submitted" and not force:
+        if existing and existing.status in ("submitted", "submission_unknown") and not force:
             extra = f"（{existing.bv_id}）" if existing.bv_id else ""
             if skip_if_submitted:
                 logger.info("跳过已投稿成功的 %s%s", meta.video_id, extra)
@@ -375,12 +407,14 @@ def _run_one(
         try:
             return _execute(settings, store, task, meta, work_dir, dry_run=dry_run)
         except Yt2BiliError as exc:
-            task.status = "failed"
+            if task.status != "submission_unknown":
+                task.status = "failed"
             task.error = str(exc)
             store.upsert(task)
             raise
         except Exception as exc:
-            task.status = "failed"
+            if task.status != "submission_unknown":
+                task.status = "failed"
             task.error = f"未预期错误：{exc}"
             store.upsert(task)
             raise Yt2BiliError(task.error) from exc
@@ -388,6 +422,8 @@ def _run_one(
         if log_path is not None:
             _detach_file_handler(log_path, meta.video_id)
         _current.video_id = None
+
+        task_lock.__exit__(None, None, None)
 
 
 def _execute(
@@ -515,17 +551,17 @@ def _submit_ready(settings, store, task, meta, work_dir: Path, *, dry_run: bool)
 
     task.status = "uploading"
     store.upsert(task)
-    bv = _upload_serialized(
-        settings,
-        log,
-        video_path,
-        cover_path,
-        task.title_zh,
-        task.desc_zh,
-        meta.webpage_url,
-    )
+    try:
+        bv = _upload_serialized(
+            settings, log, video_path, cover_path, task.title_zh, task.desc_zh, meta.webpage_url,
+        )
+    except Exception:
+        task.status = "submission_unknown"
+        task.error = "投稿过程未确认完成，请核对创作中心后再操作。"
+        store.upsert(task)
+        raise
     task.bv_id = bv
-    task.status = "submitted"
+    task.status = "submitted" if bv else "submission_unknown"
     task.error = ""
     store.upsert(task)
     if bv:
@@ -551,7 +587,7 @@ def _upload_serialized(
     source_url: str,
 ) -> str:
     global _last_upload_monotonic
-    with _upload_lock:
+    with _upload_lock, upload_guard(settings):
         gap = settings.upload_gap_seconds
         if _last_upload_monotonic > 0 and gap > 0:
             wait = gap - (time.monotonic() - _last_upload_monotonic)

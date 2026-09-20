@@ -9,6 +9,16 @@ build/
 .idea/
 .vscode/
 *.log
+.desktop-venv/
+.desktop-dev/
+.toolchains/
+node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/test-results/
+desktop/playwright-report/
+packaging/staging/
+
 
 # runtime data
 work/

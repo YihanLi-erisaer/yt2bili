@@ -17,6 +17,10 @@ dependencies = [
 
 [project.scripts]
 yt2bili = "yt2bili.cli:main"
+yt2bili-worker = "yt2bili.desktop_worker:main"
+
+[project.optional-dependencies]
+desktop = ["keyring>=25,<26", "qrcode[pil]>=8,<9"]
 
 [tool.setuptools.packages.find]
 include = ["yt2bili*"]

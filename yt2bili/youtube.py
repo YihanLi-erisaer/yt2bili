@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 import yt_dlp
 
 from yt2bili import media
+from yt2bili import events
 from yt2bili.config import Settings
 from yt2bili.exceptions import InvalidMediaError, Yt2BiliError
 
@@ -481,6 +482,7 @@ def _extract(url: str, settings: Settings, download: bool) -> dict[str, Any]:
 
 
 def _base_opts(settings: Settings) -> dict[str, Any]:
+    events.check_cancelled()
     runtimes = _js_runtimes(settings.bin_dir)
     global _js_runtime_logged
     if not _js_runtime_logged:
@@ -494,6 +496,7 @@ def _base_opts(settings: Settings) -> dict[str, Any]:
             logger.info("YouTube JS 运行时：%s", describe_js_runtimes(settings))
 
     opts: dict[str, Any] = {
+        "progress_hooks": [events.download_progress],
         "quiet": False,
         "progress_delta": 2,
         "no_warnings": False,

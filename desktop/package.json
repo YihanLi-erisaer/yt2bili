@@ -1,0 +1,36 @@
+{
+  "name": "yt2bili-desktop",
+  "version": "0.2.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "desktop": "node scripts/tauri.mjs dev",
+    "desktop:build": "node scripts/tauri.mjs build --no-bundle",
+    "tauri": "node scripts/tauri.mjs",
+    "test": "playwright test",
+    "test:e2e": "playwright test",
+    "test:launcher": "node --test scripts/launch-env.test.mjs"
+  },
+  "dependencies": {
+    "@fontsource/inter": "^5.2.0",
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "@tauri-apps/plugin-opener": "^2.5.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "prettier": "^3.9.8",
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0"
+  }
+}
