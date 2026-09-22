@@ -142,12 +142,11 @@ def upload(
             str(settings.bili_tid),
             "--cover",
             str(cover),
-            "--title",
-            title,
-            "--desc",
-            description,
-            "--tag",
-            settings.bili_tags,
+            # Bind free-form values to their options so leading '-' characters
+            # are not interpreted as biliup flags (e.g. description separators).
+            f"--title={title}",
+            f"--desc={description}",
+            f"--tag={settings.bili_tags}",
         ]
         logger.info(
             "开始上传到 B 站（分区 tid=%s，线路 %s，Web投稿，创作声明：内容无需标注）",
