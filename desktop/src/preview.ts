@@ -100,24 +100,26 @@ export async function request(method: string, params: any): Promise<any> {
       },
     };
   if (method === "translation.jobs.get")
-    return params.job_id
-      ? translationJobs.find((j) => j.job_id === params.job_id)
-      : { items: translationJobs };
+    return structuredClone(
+      params.job_id
+        ? translationJobs.find((j) => j.job_id === params.job_id)
+        : { items: translationJobs },
+    );
   if (method === "translation.install" || method === "translation.test") {
-    const job = {
+    const job: any = {
       job_id: crypto.randomUUID(),
       kind: method.endsWith("test") ? "test:" + params.provider : "install",
       state: "running",
-      result: {
-        title: "更好的工作流",
-        description: "构建实用工具。保留版本 2.0。",
-        elapsed_ms: 800,
-      },
     };
     translationJobs.push(job);
     setTimeout(() => {
       if (job.state === "running") {
         job.state = "complete";
+        job.result = {
+          title: "更好的工作流",
+          description: "构建实用工具。保留版本 2.0。",
+          elapsed_ms: 800,
+        };
         if (job.kind === "install") localInstalled = true;
         config.translation_ready = true;
       }
