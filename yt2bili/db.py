@@ -84,7 +84,13 @@ class TaskStore:
             tables = {r[0] for r in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             columns = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)")}
             if "task_id" in columns:
+                # Early multi-account v2 databases predate these bookkeeping tables.
+                # Keep the existing task/account identities and create only missing tables.
+                self._conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL)")
+                self._conn.execute("CREATE TABLE IF NOT EXISTS import_conflicts(source_id TEXT,legacy_id TEXT,payload TEXT,existing_task_id TEXT,PRIMARY KEY(source_id,legacy_id))")
                 self._translation_schema()
+                if self._conn.execute("PRAGMA foreign_key_check").fetchone():
+                    raise Yt2BiliError("数据库迁移引用检查失败。")
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 self._conn.execute("INSERT OR REPLACE INTO schema_migrations VALUES(?,?)", (SCHEMA_VERSION, _now()))
                 return

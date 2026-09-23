@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -85,3 +86,35 @@ class JointMigrationTests(unittest.TestCase):
                 self.assertEqual(store._conn.execute("SELECT task_id FROM translation_attempts").fetchone()[0], first.task_id)
             finally:
                 store.close()
+
+    def test_early_multi_account_v2_without_bookkeeping_tables(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tasks.sqlite"
+            store = TaskStore(path)
+            task = Task("abcdefghijk", "url", "submitted", title_zh="保留标题", bv_id="BV-existing")
+            store.upsert(task)
+            store.save_job(task.task_id, {"settings": {"bili_tid": 171}, "mode": "preview"})
+            before = dict(store._conn.execute("SELECT * FROM tasks").fetchone())
+            store._conn.executescript("""
+                DROP TABLE schema_migrations;
+                DROP TABLE import_conflicts;
+                DROP TABLE task_translation;
+                DROP TABLE translation_attempts;
+                PRAGMA user_version=2;
+            """)
+            store.close()
+            for _ in range(2):  # Migration and subsequent normal startup both work.
+                store = TaskStore(path)
+                try:
+                    self.assertEqual(dict(store._conn.execute("SELECT * FROM tasks").fetchone()), before)
+                    self.assertEqual(store._conn.execute("PRAGMA user_version").fetchone()[0], 3)
+                    self.assertEqual(store._conn.execute("SELECT version FROM schema_migrations").fetchone()[0], 3)
+                    self.assertEqual(store._conn.execute("SELECT * FROM import_conflicts").fetchall(), [])
+                    self.assertEqual(store._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+                    self.assertEqual(store.get_job(task.task_id)["settings"]["translation_primary"], "deepl")
+                    self.assertEqual(store.translation(task.task_id)["state"], "legacy_preserved")
+                finally:
+                    store.close()
+            with closing(sqlite3.connect(str(path) + ".pre-v3.bak")) as backup:
+                self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(backup.execute("SELECT task_id,bv_id FROM tasks").fetchone(), (task.task_id, task.bv_id))
