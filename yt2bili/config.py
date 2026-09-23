@@ -30,6 +30,8 @@ class Settings:
     title_limit: int = 80
     cover_width: int = 1280
     cover_height: int = 720
+    account_id: str | None = None
+    account_uid: str | None = None
     translation_primary: str = "local_llm"
     translation_fallback_enabled: bool = True
     local_llm_mode: str = "managed"
@@ -71,7 +73,7 @@ def load_settings() -> Settings:
     tid = int(os.getenv("BILI_TID", "171"))
     # Auto-probe often picks bldsa, whose CDN cert currently fails rustls on Windows.
     line = os.getenv("BILI_LINE", "tx").strip() or "tx"
-    # Each of the three stage queues always has exactly one worker.
+    # Download/validation stay shared; upload concurrency belongs to account lanes.
     download_jobs = 1
     upload_gap_seconds = _env_int("UPLOAD_GAP_SECONDS", 20, lo=0, hi=600)
 

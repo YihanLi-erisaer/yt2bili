@@ -17,7 +17,7 @@ def sync_files(task, folder):
 
 
 def prepare(settings, store, task, meta, folder, *, force=False):
-    record = store.translation(task.video_id) or {}
+    record = store.translation(task.task_id) or {}
     if not force and (record.get("state") in ("complete", "edited", "legacy_preserved", "skipped") or task.title_zh):
         if not record.get("state"):
             record.update(state="legacy_preserved", provider="unknown", user_edited=False)
@@ -34,7 +34,7 @@ def prepare(settings, store, task, meta, folder, *, force=False):
         result = translate_group(settings, meta.title, meta.description, meta.language,
                                  settings.title_limit, max(200, settings.desc_limit-reserve), config=config)
     except TranslationError as exc:
-        store.translation_attempt(task.video_id, getattr(exc, "attempts", [{"code": exc.code}]))
+        store.translation_attempt(task.task_id, getattr(exc, "attempts", [{"code": exc.code}]))
         raise
     events.check_cancelled()
     new_record = {**asdict(result), "state": "skipped" if result.skipped_reason else "complete",
@@ -49,5 +49,5 @@ def prepare(settings, store, task, meta, folder, *, force=False):
     except Exception:
         task.title_zh, task.desc_zh = title_before, desc_before
         raise
-    store.translation_attempt(task.video_id, result.attempts)
+    store.translation_attempt(task.task_id, result.attempts)
     sync_files(task, folder)

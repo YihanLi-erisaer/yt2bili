@@ -19,6 +19,7 @@ import requests
 import qrcode
 
 from yt2bili.desktop_settings import atomic_json
+from yt2bili.identity import normalize_uid
 from yt2bili.exceptions import Yt2BiliError
 
 
@@ -48,9 +49,10 @@ def signed_form(extra):
 
 
 class LoginSession:
-    def __init__(self, destination, emit, post=None):
+    def __init__(self, destination, emit, post=None, commit=None, account_id=None):
         self.destination, self.emit = destination, emit
         self.post = post or requests.post
+        self.commit, self.account_id = commit, account_id
         self.cancelled = threading.Event()
         self.session_id = str(uuid.uuid4())
         self.thread = None
@@ -59,7 +61,7 @@ class LoginSession:
     def send(self, status, **extra):
         with self.guard:
             if not self.cancelled.is_set():
-                self.emit("auth.status", {"session_id": self.session_id, "status": status, **extra})
+                self.emit("auth.status", {"session_id": self.session_id, "account_id": self.account_id, "status": status, **extra})
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="bili-login", daemon=True)
@@ -100,7 +102,10 @@ class LoginSession:
                     with self.guard:
                         if self.cancelled.is_set():
                             return
-                        atomic_json(self.destination, info)
+                        if self.commit:
+                            self.account_id = self.commit(info)["account_id"]
+                        else:
+                            atomic_json(self.destination, info)
                     self.send("success")
                     return
                 if code in (86039, 86101):
@@ -115,6 +120,32 @@ class LoginSession:
         except Exception as exc:
             # Never include response bodies or token-bearing request URLs.
             self.send("failed", message=str(exc) if isinstance(exc, Yt2BiliError) else "登录网络请求失败，请检查网络后重试。")
+
+
+def credential_identity(info):
+    validate_login(info)
+    uid = normalize_uid(info["token_info"]["mid"])
+    cookies = {item["name"]: item["value"] for item in info["cookie_info"]["cookies"]}
+    if uid != normalize_uid(cookies["DedeUserID"]):
+        raise Yt2BiliError("Cookie 与 Token 的账号 UID 不一致，未替换原登录态。")
+    return uid
+
+
+def verify_credentials(info):
+    uid = credential_identity(info)
+    cookies = {item["name"]: item["value"] for item in info["cookie_info"]["cookies"]}
+    try:
+        response = requests.get("https://api.bilibili.com/x/web-interface/nav", cookies=cookies, timeout=15,
+                                headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise Yt2BiliError("账号验证暂不可用，请检查网络后重试。") from exc
+    if data.get("code") != 0 or not data.get("data", {}).get("isLogin"):
+        raise Yt2BiliError("登录失效，请重新登录该账号。")
+    if normalize_uid(data["data"].get("mid")) != uid:
+        raise Yt2BiliError("在线账号与目标 UID 不一致，已阻止投稿。")
+    return {"uid": uid, "nickname": data["data"].get("uname", "")}
 
 
 def account_status(path, verify=False):

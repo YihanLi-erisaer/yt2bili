@@ -67,7 +67,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(record['state'],'legacy_preserved')
         self.assertEqual(record['config_snapshot']['translation_primary'],'deepl')
         self.assertFalse(record['config_snapshot']['translation_fallback_enabled'])
-        self.assertTrue((self.root/'tasks.sqlite.pre-translation.bak').is_file())
+        self.assertTrue((self.root/'tasks.sqlite.pre-v3.bak').is_file())
         self.assertEqual(self.store.get_job(self.task.video_id)['settings']['translation_primary'],'deepl')
 
     def test_vault_failure_does_not_prevent_local_settings_build(self):

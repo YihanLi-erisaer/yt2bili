@@ -3,6 +3,8 @@ const testPort = process.env.YT2BILI_TEST_PORT || "1420";
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: true,
+  workers: 1,
+  timeout: 60000,
   use: {
     baseURL: `http://127.0.0.1:${testPort}`,
     channel: "msedge",
@@ -10,8 +12,8 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
   webServer: {
-    command: `npm run dev -- --port ${testPort}`,
+    command: `node node_modules/vite/bin/vite.js --host 127.0.0.1 --port ${testPort}`,
     url: `http://127.0.0.1:${testPort}`,
-    reuseExistingServer: !process.env.YT2BILI_TEST_PORT,
+    reuseExistingServer: true,
   },
 });

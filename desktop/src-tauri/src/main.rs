@@ -22,7 +22,7 @@ async fn backend_request(worker: State<'_, Worker>, method: String, params: Valu
     let id = worker.next.fetch_add(1, Ordering::Relaxed).to_string();
     let (tx, rx) = oneshot::channel();
     worker.pending.lock().unwrap().insert(id.clone(), tx);
-    let message = json!({"protocol_version":1,"request_id":id,"method":method,"params":params}).to_string();
+    let message = json!({"protocol_version":2,"request_id":id,"method":method,"params":params}).to_string();
     if message.len() > 1_000_000 {
         worker.pending.lock().unwrap().remove(&id);
         return Err("请求超过大小限制".into());
@@ -42,14 +42,19 @@ async fn backend_request(worker: State<'_, Worker>, method: String, params: Valu
 }
 
 #[tauri::command]
-fn finish_close(app: tauri::AppHandle) { app.exit(0); }
+async fn finish_close(app: tauri::AppHandle, worker: State<'_, Worker>) -> Result<(), String> {
+    let status = backend_request(worker, "system.shutdown_status".into(), json!({})).await?;
+    if status["ready"] != true { return Err("后台仍在收尾，请等待上传完成。".into()); }
+    app.exit(0);
+    Ok(())
+}
 
 #[tauri::command]
 fn frontend_ready(app: tauri::AppHandle, health: Value) {
     // Only an isolated development smoke run sets this variable.
     if cfg!(debug_assertions) {
         if let Some(report) = std::env::var_os("YT2BILI_NATIVE_SMOKE_REPORT") {
-            let value = json!({"ok":health["protocol_version"] == 1,"webview_loaded":true,
+            let value = json!({"ok":health["protocol_version"] == 2,"webview_loaded":true,
                 "frontend_ipc":true,"protocol_version":health["protocol_version"]});
             let _ = std::fs::write(report, value.to_string());
             app.exit(0);

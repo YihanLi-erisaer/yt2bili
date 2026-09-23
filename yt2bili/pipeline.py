@@ -16,7 +16,7 @@ from yt2bili.db import Task, TaskStore
 from yt2bili.exceptions import InvalidMediaError, Yt2BiliError
 from yt2bili.youtube import YoutubeMeta
 from yt2bili import events
-from yt2bili.locking import upload_guard, work_lock
+from yt2bili.locking import work_lock
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +25,20 @@ NOTICE = (
     "稿件创作声明为「内容无需标注」，简介会保留原标题、原作者和原链接。"
 )
 
-_upload_lock = threading.Lock()
-_last_upload_monotonic = 0.0
+_translate_lock = threading.Lock()
 _current = threading.local()
 MAX_MEDIA_ATTEMPTS = 5
+
+
+@contextmanager
+def _translation_slot():
+    while not _translate_lock.acquire(timeout=.1):
+        events.check_cancelled()
+    try:
+        events.check_cancelled()
+        yield
+    finally:
+        _translate_lock.release()
 
 
 @dataclass
@@ -48,26 +58,29 @@ def _job_context(job: _PipelineJob):
     assert job.task is not None and job.work_dir is not None
     previous = getattr(_current, "video_id", None)
     _current.video_id = job.task.video_id
+    identity = job.task.task_id or job.task.video_id
     log_path = job.work_dir / "pipeline.log"
-    _attach_file_handler(log_path, job.task.video_id)
+    _attach_file_handler(log_path, identity)
     try:
         yield
     finally:
-        _detach_file_handler(log_path, job.task.video_id)
+        _detach_file_handler(log_path, identity)
         _current.video_id = previous
 
 
 def _download_job(settings, store, job: _PipelineJob, force: bool, seen_ids: set[str]):
-    if job.task is None:
+    if job.meta is None:
         meta = youtube.fetch_meta(job.url, settings)
         if meta.video_id in seen_ids:
             job.skipped = True
             logger.info("同一视频的重复链接已跳过：%s", job.url)
             return
         seen_ids.add(meta.video_id)
-        existing = store.get(meta.video_id)
+        existing = job.task if job.task is not None else store.get(meta.video_id)
+        if job.task is not None and meta.video_id != job.task.video_id:
+            raise Yt2BiliError("解析的视频 ID 与任务不一致，已停止下载。")
         job.meta = meta
-        job.work_dir = settings.work_dir / meta.video_id
+        job.work_dir = Path(existing.work_dir) if existing and existing.work_dir else settings.work_dir / meta.video_id
         if existing and existing.status in ("submitted", "submission_unknown") and not force:
             job.task = existing
             job.skipped = True
@@ -437,7 +450,7 @@ def _execute(
     *,
     dry_run: bool,
 ) -> Task:
-    log = logging.getLogger(f"yt2bili.task.{task.video_id}")
+    log = logging.getLogger(f"yt2bili.task.{task.task_id or task.video_id}")
     meta.save(work_dir / "meta.json")
     task.title_orig = meta.title
     task.desc_orig = meta.description
@@ -479,7 +492,7 @@ def _execute(
 
 def _prepare_assets(settings, store, task, meta, work_dir: Path, video_path: Path) -> None:
     """Prepare submission assets, outside the batch's download/validation queues."""
-    log = logging.getLogger(f"yt2bili.task.{task.video_id}")
+    log = logging.getLogger(f"yt2bili.task.{task.task_id or task.video_id}")
 
     cover_path = work_dir / "cover.jpg"
     task.status = "processing_cover"
@@ -517,7 +530,7 @@ def _prepare_assets(settings, store, task, meta, work_dir: Path, video_path: Pat
 
 
 def _submit_ready(settings, store, task, meta, work_dir: Path, *, dry_run: bool) -> Task:
-    log = logging.getLogger(f"yt2bili.task.{task.video_id}")
+    log = logging.getLogger(f"yt2bili.task.{task.task_id or task.video_id}")
     video_path = Path(task.video_path)
     cover_path = Path(task.cover_path)
     from yt2bili.translation.tasks import sync_files
@@ -544,6 +557,7 @@ def _submit_ready(settings, store, task, meta, work_dir: Path, *, dry_run: bool)
     task.error = ""
     store.upsert(task)
     if bv:
+        _detach_file_handler(work_dir / "pipeline.log", task.task_id or task.video_id)
         _cleanup_uploaded_files(settings, work_dir)
         if not work_dir.exists():
             task.work_dir = ""
@@ -565,31 +579,7 @@ def _upload_serialized(
     description: str,
     source_url: str,
 ) -> str:
-    global _last_upload_monotonic
-    with _upload_lock, upload_guard(settings):
-        gap = settings.upload_gap_seconds
-        if _last_upload_monotonic > 0 and gap > 0:
-            wait = gap - (time.monotonic() - _last_upload_monotonic)
-            if wait > 0:
-                log.info("上传排队中，等待 %.0f 秒…", wait)
-                time.sleep(wait)
-        try:
-            try:
-                bili_upload.renew(settings)
-            except Yt2BiliError:
-                raise
-            except Exception as exc:
-                log.warning("刷新登录态时出错，继续投稿：%s", exc)
-            return bili_upload.upload(
-                settings,
-                video_path,
-                cover_path,
-                title,
-                description,
-                source_url,
-            )
-        finally:
-            _last_upload_monotonic = time.monotonic()
+    raise Yt2BiliError("旧上传入口已停用，请使用带 task_id 和账号队列的 DesktopService。")
 
 
 def _dedupe_urls(urls: list[str]) -> list[str]:
