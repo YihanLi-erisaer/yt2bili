@@ -61,6 +61,8 @@ import {
   type Task,
 } from "./types";
 import SetupWizard from "./SetupWizard";
+import { AccountsPanel, AccountSelector, QueueOverview } from "./Accounts";
+import { accountLabel, type BiliAccount } from "./types";
 
 type Page = "tasks" | "history" | "account" | "settings";
 type Notice = { kind: "success" | "error"; text: string };
@@ -128,6 +130,7 @@ export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [total, setTotal] = useState(0);
+  const [allTotal, setAllTotal] = useState(0);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [progress, setProgress] = useState<Record<string, Progress>>({});
   const [connected, setConnected] = useState(false);
@@ -147,6 +150,12 @@ export default function App() {
   });
   const [diagnostics, setDiagnostics] = useState<any>(null);
   const [closing, setClosing] = useState(false);
+  const [queue, setQueue] = useState<any>(null);
+  const [accountFilter, setAccountFilter] = useState("");
+  const [accountOptions, setAccountOptions] = useState<BiliAccount[]>([]);
+  const [shutdownStarted, setShutdownStarted] = useState(false);
+  const taskRequest = useRef(0);
+  const latestTasks = useRef<Record<string, Task>>({});
   const [queueActive, setQueueActive] = useState<any[]>([]);
   const action = useCallback(
     async (work: () => Promise<unknown>, success?: string) => {
@@ -174,36 +183,51 @@ export default function App() {
     [],
   );
   const loadTasks = useCallback(async () => {
+    const generation = ++taskRequest.current;
     const result = await request("tasks.list", {
+      account_id: accountFilter,
       search: query,
       status: filter,
       offset,
       limit: 50,
       history: page === "history",
     });
+    if (generation !== taskRequest.current) return;
+    result.items = result.items.map((t: Task) => {
+      const old = latestTasks.current[t.task_id];
+      const value = old && old.revision > t.revision ? { ...t, ...old } : t;
+      latestTasks.current[t.task_id] = value;
+      return value;
+    });
     setTasks(result.items);
+    setQueue((old: any) =>
+      !old || (result.queue.queue_revision || 0) >= (old.queue_revision || 0)
+        ? result.queue
+        : old,
+    );
     setTotal(result.total);
+    setAllTotal(result.all_total ?? result.total);
     setCounts(result.counts);
     setQueueActive(result.queue.active);
     setSelected((old) =>
       old
         ? {
             ...old,
-            ...result.items.find((t: Task) => t.video_id === old.video_id),
+            ...result.items.find((t: Task) => t.task_id === old.task_id),
           }
         : null,
     );
-  }, [query, filter, offset, page]);
-  const refreshAccount = useCallback(
-    async () => setAuth(await request("auth.status")),
-    [],
-  );
+  }, [query, filter, offset, page, accountFilter]);
+  const refreshAccount = useCallback(async () => {
+    setAuth(await request("auth.status"));
+    setAccountOptions((await request("accounts.list")).items);
+  }, []);
 
   useEffect(() => {
     let alive = true;
     request("system.health")
       .then(async (result) => {
-        if (result.protocol_version !== 1)
+        if (result.protocol_version !== 2)
           throw new Error("桌面与后台协议版本不匹配。");
         if (alive) {
           setConnected(true);
@@ -223,29 +247,53 @@ export default function App() {
     let stopClose = () => {};
     subscribe((event) => {
       if (!alive) return;
+      if (event.event === "accounts.changed") void refreshAccount();
+      if (event.event === "queue.changed") {
+        setQueue((old: any) =>
+          !old ||
+          (event.payload.queue_revision || 0) >= (old.queue_revision || 0)
+            ? event.payload
+            : old,
+        );
+        setQueueActive(event.payload.active || []);
+      }
       if (event.event === "task.status") {
+        const before = latestTasks.current[event.payload.task_id];
+        if (before && before.revision > event.payload.revision) return;
+        latestTasks.current[event.payload.task_id] = {
+          ...before,
+          ...event.payload,
+        };
         setTasks((old) =>
           old.map((task) =>
-            task.video_id === event.payload.video_id
+            task.task_id === event.payload.task_id &&
+            event.payload.revision >= task.revision
               ? { ...task, ...event.payload }
               : task,
           ),
         );
         setSelected((old) =>
-          old?.video_id === event.payload.video_id
+          old &&
+          old.task_id === event.payload.task_id &&
+          event.payload.revision >= old.revision
             ? { ...old, ...event.payload }
             : old,
         );
         setProgress((old) => {
           const next = { ...old };
-          delete next[event.payload.video_id];
+          delete next[event.payload.task_id];
           return next;
         });
       }
-      if (event.event === "task.progress")
+      if (
+        event.event === "task.progress" &&
+        (!latestTasks.current[event.payload.task_id]?.run_id ||
+          latestTasks.current[event.payload.task_id]?.run_id ===
+            event.payload.run_id)
+      )
         setProgress((old) => ({
           ...old,
-          [event.payload.video_id]: event.payload,
+          [event.payload.task_id]: event.payload,
         }));
       if (event.event === "auth.status") {
         setAuth((old: any) => ({
@@ -338,6 +386,28 @@ export default function App() {
     addEventListener("keydown", key);
     return () => removeEventListener("keydown", key);
   }, [connected]);
+
+  useEffect(() => {
+    if (!shutdownStarted) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const state = await request("system.shutdown_status");
+        if (state.ready && !stop) {
+          await closeApp();
+          return;
+        }
+      } catch (e) {
+        setNotice({ kind: "error", text: String(e) });
+      }
+      if (!stop) timer = setTimeout(tick, 500);
+    };
+    let timer = setTimeout(tick, 0);
+    return () => {
+      stop = true;
+      clearTimeout(timer);
+    };
+  }, [shutdownStarted]);
 
   const navigate = (next: Page) => {
     setPage(next);
@@ -535,7 +605,7 @@ export default function App() {
                             {String(s.value || 0).padStart(2, "0")}
                           </strong>
                         </div>
-                        {index < 3 && <small>单路队列</small>}
+                        {index < 2 && <small>共享单路</small>}
                       </div>
                     ))}
                   </div>
@@ -560,6 +630,25 @@ export default function App() {
                     </button>
                   </div>
                 )}
+                <QueueOverview queue={queue} accounts={auth.accounts || []} />
+                <label className="field">
+                  按账号筛选
+                  <select
+                    aria-label="按账号筛选"
+                    value={accountFilter}
+                    onChange={(e) => {
+                      setAccountFilter(e.target.value);
+                      setOffset(0);
+                    }}
+                  >
+                    <option value="">全部账号</option>
+                    {accountOptions.map((a) => (
+                      <option key={a.account_id} value={a.account_id}>
+                        {accountLabel(a)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <div className="task-panel">
                   <div className="panel-toolbar">
                     <div className="tabs">
@@ -570,7 +659,7 @@ export default function App() {
                           setOffset(0);
                         }}
                       >
-                        全部任务 <span>{total}</span>
+                        全部任务 <span>{allTotal}</span>
                       </button>
                       {(page === "history"
                         ? ["submitted", "submission_unknown"]
@@ -611,13 +700,13 @@ export default function App() {
                     <div className="task-rows">
                       {tasks.map((task) => (
                         <button
-                          key={task.video_id}
+                          key={task.task_id}
                           className="task-row"
                           onClick={() =>
                             action(async () =>
                               setSelected(
                                 await request("tasks.get", {
-                                  video_id: task.video_id,
+                                  task_id: task.task_id,
                                 }),
                               ),
                             )
@@ -634,18 +723,22 @@ export default function App() {
                                   "等待读取视频信息"}
                               </strong>
                               <small>
-                                {task.video_id}
+                                {task.video_id} ·{" "}
+                                {task.account_name_snapshot || "历史账号待确认"}
+                                {task.account_uid_snapshot
+                                  ? ` (UID ${task.account_uid_snapshot})`
+                                  : ""}
                                 {task.uploader && ` · ${task.uploader}`}
                               </small>
                             </span>
                           </span>
                           <span>
                             <Status status={task.status} />
-                            {active(task) && progress[task.video_id] && (
+                            {active(task) && progress[task.task_id] && (
                               <span className="mini-progress">
                                 <i
                                   style={{
-                                    width: `${progress[task.video_id].percent ?? 25}%`,
+                                    width: `${progress[task.task_id].percent ?? 25}%`,
                                   }}
                                 />
                               </span>
@@ -803,6 +896,7 @@ export default function App() {
         )}
         {newTask && (
           <NewTask
+            accounts={auth.accounts || []}
             busy={busy}
             action={action}
             close={() => {
@@ -817,54 +911,51 @@ export default function App() {
         {selected && (
           <TaskDetail
             task={selected}
-            progress={progress[selected.video_id]}
+            accounts={accountOptions}
+            progress={progress[selected.task_id]}
             busy={busy}
             action={action}
             close={() => setSelected(null)}
             refresh={async () => {
               await loadTasks();
               setSelected(
-                await request("tasks.get", { video_id: selected.video_id }),
+                await request("tasks.get", { task_id: selected.task_id }),
               );
             }}
           />
         )}
         {closing && (
-          <Modal title="退出 yt2bili" close={() => setClosing(false)}>
+          <Modal
+            title="退出 yt2bili"
+            close={() => {
+              if (!shutdownStarted) setClosing(false);
+            }}
+          >
             <p className="modal-copy">
-              {queueActive.length
-                ? "还有任务在运行。投稿中的任务需要完成后再退出；其他任务可取消并保留素材。"
-                : "当前没有运行中的任务，可以安全退出。"}
+              {shutdownStarted
+                ? "正在停止未投稿任务并保留素材；等待所有在途投稿结束后退出。"
+                : "退出会取消未投稿任务，并等待正在投稿的账号完成。"}
             </p>
             <div className="modal-actions">
-              <button className="secondary" onClick={() => setClosing(false)}>
+              <button
+                disabled={shutdownStarted}
+                className="secondary"
+                onClick={() => setClosing(false)}
+              >
                 继续使用
               </button>
-              {queueActive.length ? (
-                <button
-                  className="primary"
-                  disabled={busy}
-                  onClick={() =>
-                    action(async () => {
-                      for (const item of queueActive) {
-                        const task = await request<Task>("tasks.get", {
-                          video_id: item.video_id,
-                        });
-                        if (task.status !== "uploading")
-                          await request("tasks.cancel", {
-                            video_id: item.video_id,
-                          });
-                      }
-                    }, "已请求取消，请等待队列停止后退出。")
-                  }
-                >
-                  取消未提交任务
-                </button>
-              ) : (
-                <button className="primary" onClick={() => closeApp()}>
-                  退出应用
-                </button>
-              )}
+              <button
+                disabled={shutdownStarted || busy}
+                className="primary"
+                onClick={() =>
+                  action(async () => {
+                    await request("system.prepare_shutdown");
+                    setShutdownStarted(true);
+                  })
+                }
+              >
+                {shutdownStarted ? "等待安全退出…" : "退出应用"}
+              </button>
             </div>
           </Modal>
         )}
@@ -875,31 +966,32 @@ export default function App() {
 
 type Action = (work: () => Promise<unknown>, success?: string) => Promise<void>;
 function NewTask({
+  accounts,
   busy,
   action,
   close,
   done,
 }: {
+  accounts: BiliAccount[];
   busy: boolean;
   action: Action;
   close: () => void;
   done: () => Promise<void>;
 }) {
+  const [accountId, setAccountId] = useState("");
   const [text, setText] = useState("");
   const [mode, setMode] = useState("preview");
   const [authorized, setAuthorized] = useState(false);
   const op = useRef(operationId());
   return (
     <Modal title="新建任务" close={close}>
-      <p className="modal-copy">
-        添加你有权处理的视频。每行一个链接，也可以导入 TXT 列表。
-      </p>
+      <p className="modal-copy">每次添加一个视频，并选择本次投稿的账号。</p>
       <label className="field">
         YouTube 视频链接
-        <textarea
+        <input
           autoFocus
-          rows={6}
-          placeholder={"https://www.youtube.com/watch?v=…\nhttps://youtu.be/…"}
+          type="url"
+          placeholder="https://www.youtube.com/watch?v=…"
           value={text}
           onChange={(e) => {
             setText(e.target.value);
@@ -907,21 +999,17 @@ function NewTask({
           }}
         />
       </label>
-      <button
-        className="text-button"
-        onClick={() =>
-          action(async () => {
-            const path = await chooseFile();
-            if (path) {
-              setText((await request("files.read_urls", { path })).text);
-              op.current = operationId();
-            }
-          })
-        }
-        disabled={busy}
-      >
-        <FileText size={15} />从 TXT 文件导入
-      </button>
+      <AccountSelector
+        accounts={accounts}
+        value={accountId}
+        onChange={(id) => {
+          setAccountId(id);
+          op.current = operationId();
+        }}
+      />
+      {!accounts.length && (
+        <p className="help">请先到账号与连接添加 Bilibili 账号。</p>
+      )}
       <div className="mode-options">
         <label className={mode === "preview" ? "chosen" : ""}>
           <input
@@ -962,7 +1050,7 @@ function NewTask({
           checked={authorized}
           onChange={(e) => setAuthorized(e.target.checked)}
         />
-        我拥有这些视频的版权或已获得转载授权。
+        我拥有该视频的版权或已获得转载授权。
       </label>
       <div className="modal-actions">
         <button className="secondary" onClick={close} disabled={busy}>
@@ -970,16 +1058,17 @@ function NewTask({
         </button>
         <button
           className="primary"
-          disabled={busy || !text.trim() || !authorized}
+          disabled={busy || !text.trim() || !authorized || !accountId}
           onClick={() =>
             action(async () => {
               const result = await request("tasks.create", {
-                text,
+                url: text,
+                account_id: accountId,
                 mode,
                 operation_id: op.current,
               });
-              if (!result.added.length)
-                throw new Error("这些视频已有任务，请在列表中查看或继续。");
+              if (!result.created)
+                throw new Error("该账号已有此视频任务，请在列表中查看或继续。");
               await done();
             }, "任务已加入队列。")
           }
@@ -993,6 +1082,7 @@ function NewTask({
 }
 
 function TaskDetail({
+  accounts,
   task,
   progress,
   busy,
@@ -1000,6 +1090,7 @@ function TaskDetail({
   close,
   refresh,
 }: {
+  accounts: BiliAccount[];
   task: Task;
   progress?: Progress;
   busy: boolean;
@@ -1007,6 +1098,7 @@ function TaskDetail({
   close: () => void;
   refresh: () => Promise<void>;
 }) {
+  const [legacyAccount, setLegacyAccount] = useState("");
   const [tab, setTab] = useState("metadata");
   const [title, setTitle] = useState(task.title_zh);
   const [description, setDescription] = useState(task.desc_zh);
@@ -1018,10 +1110,10 @@ function TaskDetail({
   useEffect(() => {
     setTitle(task.title_zh);
     setDescription(task.desc_zh);
-  }, [task.video_id, task.title_zh, task.desc_zh]);
+  }, [task.task_id, task.title_zh, task.desc_zh]);
   useEffect(() => {
     let alive = true;
-    request("tasks.cover", { video_id: task.video_id })
+    request("tasks.cover", { task_id: task.task_id })
       .then((value) => {
         if (alive) setCover(value.image);
       })
@@ -1029,21 +1121,21 @@ function TaskDetail({
     return () => {
       alive = false;
     };
-  }, [task.video_id, task.cover_path]);
+  }, [task.task_id, task.cover_path]);
   useEffect(() => {
     if (tab !== "logs") return;
     const load = () =>
-      request("logs.tail", { video_id: task.video_id })
+      request("logs.tail", { task_id: task.task_id })
         .then((value) => setLogs(value.items))
         .catch(() => {});
     void load();
     const timer = setInterval(load, 1500);
     return () => clearInterval(timer);
-  }, [task.video_id, tab]);
+  }, [task.task_id, tab]);
   const command = (method: string, success: string) =>
     action(async () => {
       await request(method, {
-        video_id: task.video_id,
+        task_id: task.task_id,
         operation_id: op.current,
       });
       op.current = operationId();
@@ -1065,12 +1157,17 @@ function TaskDetail({
           <h3>{task.title_zh || task.title_orig || task.video_id}</h3>
           <p>
             {task.uploader || "等待读取作者"} · {task.video_id}
+            <br />
+            {task.account_name_snapshot || "历史账号待确认"}
+            {task.account_uid_snapshot
+              ? ` · UID ${task.account_uid_snapshot}`
+              : ""}
           </p>
           <button
             className="text-button"
             onClick={() =>
               action(async () => {
-                await request("tasks.open_folder", { video_id: task.video_id });
+                await request("tasks.open_folder", { task_id: task.task_id });
               })
             }
             disabled={!task.work_dir}
@@ -1113,6 +1210,31 @@ function TaskDetail({
               style={{ width: `${progress?.percent ?? 30}%` }}
             />
           </div>
+        </div>
+      )}
+      {!task.account_id && (
+        <div className="section-body">
+          <p>历史账号待确认：绑定后不可改投，请核对原投稿归属。</p>
+          <AccountSelector
+            accounts={accounts}
+            archived={task.status === "submitted"}
+            value={legacyAccount}
+            onChange={setLegacyAccount}
+          />
+          <button
+            disabled={busy || !legacyAccount}
+            onClick={() =>
+              action(async () => {
+                await request("tasks.bind_legacy_account", {
+                  task_id: task.task_id,
+                  account_id: legacyAccount,
+                });
+                await refresh();
+              })
+            }
+          >
+            确认历史账号
+          </button>
         </div>
       )}
       <div className="tabs detail-tabs">
@@ -1167,7 +1289,7 @@ function TaskDetail({
               onClick={() =>
                 action(async () => {
                   await request("tasks.update_metadata", {
-                    video_id: task.video_id,
+                    task_id: task.task_id,
                     title,
                     description,
                   });
@@ -1231,7 +1353,7 @@ function TaskDetail({
               onClick={() =>
                 action(async () => {
                   await request("tasks.resolve", {
-                    video_id: task.video_id,
+                    task_id: task.task_id,
                     bv_id: bv,
                   });
                   await refresh();
@@ -1250,7 +1372,7 @@ function TaskDetail({
         <div className="confirm-box">
           <strong>
             {confirm === "submit"
-              ? "确认将当前素材投稿到 B 站？"
+              ? `确认投稿到 ${task.account_name_snapshot} · UID ${task.account_uid_snapshot}？`
               : confirm === "repair"
                 ? "准备原稿件的替换视频？此操作不会投稿。"
                 : "确认创作中心没有这条稿件？"}
@@ -1269,7 +1391,7 @@ function TaskDetail({
                     ? command("tasks.repair", "已开始准备替换素材。")
                     : action(async () => {
                         await request("tasks.resolve", {
-                          video_id: task.video_id,
+                          task_id: task.task_id,
                           not_submitted: true,
                         });
                         setConfirm("");
@@ -1287,7 +1409,7 @@ function TaskDetail({
         <button className="secondary" onClick={close}>
           关闭
         </button>
-        {retryable(task) && (
+        {retryable(task) && task.account_id && (
           <button
             className="primary"
             disabled={busy}
@@ -1303,7 +1425,10 @@ function TaskDetail({
           <button
             className="primary"
             disabled={
-              busy || title !== task.title_zh || description !== task.desc_zh
+              busy ||
+              !task.account_id ||
+              title !== task.title_zh ||
+              description !== task.desc_zh
             }
             title="请先保存修改"
             onClick={() => setConfirm("submit")}
@@ -1327,7 +1452,7 @@ function TaskDetail({
             disabled={busy || task.status === "cancel_requested"}
             onClick={() =>
               action(async () => {
-                await request("tasks.cancel", { video_id: task.video_id });
+                await request("tasks.cancel", { task_id: task.task_id });
                 await refresh();
               }, "已请求取消，素材会保留。")
             }
@@ -1378,66 +1503,7 @@ function Account({
   };
   return (
     <div className="settings-stack">
-      <section className="settings-card">
-        <div className="section-title">
-          <div className="service-icon">
-            <Video size={23} />
-          </div>
-          <div>
-            <h2>哔哩哔哩</h2>
-            <p>连接投稿账号，登录凭据仅保存在本机。</p>
-          </div>
-          <span className={`pill ${auth.configured ? "positive" : ""}`}>
-            {auth.verified
-              ? "登录有效"
-              : auth.configured
-                ? "已配置 · 待检测"
-                : "未连接"}
-          </span>
-        </div>
-        <div className="section-body">
-          <p className="help">
-            {auth.name
-              ? `当前账号：${auth.name}`
-              : auth.mid
-                ? `账号 UID：${auth.mid}`
-                : "使用 B 站 App 扫码连接，或导入已有 biliup 登录文件。"}
-          </p>
-          <div className="button-row">
-            <button
-              className="primary"
-              disabled={busy}
-              onClick={() =>
-                action(async () => {
-                  await request("auth.login.start");
-                  setShowLogin(true);
-                }, undefined)
-              }
-            >
-              扫码登录 <ArrowRight size={15} />
-            </button>
-            <button
-              className="secondary"
-              disabled={busy}
-              onClick={() => importCookie("bilibili")}
-            >
-              导入登录文件
-            </button>
-            <button
-              className="text-button"
-              disabled={busy || !auth.configured}
-              onClick={() =>
-                action(async () => {
-                  setAuth(await request("auth.renew"));
-                }, "登录态检测完成。")
-              }
-            >
-              <RefreshCw size={14} />
-              刷新与检测
-            </button>
-          </div>
-        </div>
-      </section>
+      <AccountsPanel auth={auth} refresh={refresh} />
       <section className="settings-card">
         <div className="section-title">
           <div className="service-icon">
@@ -1555,56 +1621,6 @@ function Account({
           </p>
         </div>
       </section>
-      {showLogin && (
-        <Modal
-          title="连接哔哩哔哩"
-          close={() => {
-            setShowLogin(false);
-            void request("auth.login.cancel");
-          }}
-        >
-          <div className="qr-panel">
-            {["waiting", "scanned"].includes(login.status) && login.qrcode ? (
-              <img src={login.qrcode} alt="B 站登录二维码" />
-            ) : login.status === "success" ? (
-              <CheckCircle2 size={64} />
-            ) : (
-              <div className="qr-placeholder">
-                {login.status === "loading" ? (
-                  <Loader2 className="spin" size={36} />
-                ) : (
-                  <RefreshCw size={36} />
-                )}
-              </div>
-            )}
-            <h3>{loginLabels[login.status] || "准备登录"}</h3>
-            {login.message && <p className="error-text">{login.message}</p>}
-            <p className="help">二维码只用于本次登录，请勿分享给他人。</p>
-          </div>
-          <div className="modal-actions">
-            <button
-              className="secondary"
-              onClick={() => {
-                setShowLogin(false);
-                void request("auth.login.cancel");
-              }}
-            >
-              关闭
-            </button>
-            <button
-              className="primary"
-              disabled={busy}
-              onClick={() =>
-                action(async () => {
-                  await request("auth.login.start");
-                })
-              }
-            >
-              刷新二维码
-            </button>
-          </div>
-        </Modal>
-      )}
     </div>
   );
 }

@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import io
 import json
+import hashlib
+import uuid
 import os
 import re
 import shutil
@@ -24,54 +26,46 @@ from yt2bili.desktop_settings import DesktopSettings, atomic_json
 from yt2bili.exceptions import Yt2BiliError
 from yt2bili.process_manager import creation_options
 from yt2bili.scheduler import Scheduler
+from yt2bili.accounts import AccountService
+from yt2bili.identity import VIDEO_ID, parse_single_video_url
+from yt2bili.locking import FileLock, account_guard, coordination_dir, work_lock
+from dataclasses import replace
 from yt2bili.tools import find_tool
 
 
-VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
-
-
 def parse_urls(text):
-    if not isinstance(text, str) or len(text) > 250_000:
-        raise Yt2BiliError("链接列表过大或格式无效。")
-    items, errors, seen = [], [], set()
-    for index, line in enumerate(text.splitlines(), 1):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parsed = urlparse(line)
-        host = (parsed.hostname or "").lower()
-        video_id = ""
-        if parsed.scheme in ("https", "http") and not parsed.username and not parsed.password:
-            if host in ("youtu.be", "www.youtu.be"):
-                video_id = parsed.path.strip("/")
-            elif host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"):
-                if parsed.path == "/watch":
-                    video_id = parse_qs(parsed.query).get("v", [""])[0]
-                elif parsed.path.startswith(("/shorts/", "/live/", "/embed/")):
-                    video_id = parsed.path.split("/")[2]
-        if not VIDEO_ID.fullmatch(video_id):
-            errors.append(f"第 {index} 行不是有效的 YouTube 视频链接")
-        elif video_id not in seen:
-            seen.add(video_id)
-            items.append((video_id, "https://www.youtube.com/watch?v=" + video_id))
-    if errors:
-        raise Yt2BiliError("；".join(errors[:12]))
-    if not items or len(items) > 200:
-        raise Yt2BiliError("每批请输入 1～200 条视频链接。")
-    return items
-
+    # Internal compatibility helper; all public input is strictly one URL.
+    return [parse_single_video_url(text)]
 
 class DesktopService:
-    def __init__(self, paths, emit, vault=None):
+    def __init__(self, paths, emit, vault=None, config=None):
         self.paths, self.output = paths, emit
         self.logs = deque(maxlen=1500)
         self.logs_lock = threading.Lock()
         self.mutation = threading.RLock()
         self.login = None
         self.auth_state = {"status": "idle"}
-        self.config = DesktopSettings(paths, vault)
-        self.store = TaskStore(paths.root / "data/tasks.sqlite", self.emit)
-        self.scheduler = Scheduler(self.store, self.config, self.emit)
+        self.config = config or DesktopSettings(paths, vault)
+        self.owner_lock = FileLock(paths.root / "execution.lock")
+        self.owner_lock.__enter__()
+        try:
+            self.store = TaskStore(paths.root / "data/tasks.sqlite", self.emit)
+            self.accounts = AccountService(paths.root, self.store, self.emit)
+            self.scheduler = Scheduler(self.store, self.config, self.emit, self.accounts)
+        except BaseException:
+            self.owner_lock.__exit__(None, None, None)
+            raise
+        self.migration_notes = []
+        legacy_cookie = paths.root / "secrets/bili_cookies.json"
+        if not self.store.accounts(True) and legacy_cookie.is_file():
+            try:
+                if legacy_cookie.stat().st_size > 5_000_000:
+                    raise ValueError("oversize")
+                self.accounts.bind(json.loads(legacy_cookie.read_text(encoding="utf-8-sig")), verify=False)
+                self.migration_notes.append("旧登录文件已导入为待验证账号；历史任务仍需确认归属。")
+            except (ValueError, OSError, Yt2BiliError):
+                self.migration_notes.append("旧登录文件无法确认 UID，已保留原文件，请重新登录。")
+        self._closed = False
         os.environ["YT2BILI_BIN_DIR"] = str(paths.resources / "bin")
         self.apply_environment()
 
@@ -86,6 +80,8 @@ class DesktopService:
             self.auth_state = {**self.auth_state, **payload}
             if payload.get("status") not in ("waiting", "scanned"):
                 self.auth_state.pop("qrcode", None)
+        if event == "accounts.changed" and hasattr(self, "scheduler"):
+            self.scheduler.sync_accounts(payload.get("account_id"))
         self.output(event, payload)
 
     def add_log(self, entry):
@@ -97,18 +93,16 @@ class DesktopService:
         if self.scheduler.snapshot()["active"]:
             raise Yt2BiliError("请等待当前任务结束后修改设置或账号。")
 
-    def task(self, video_id):
-        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
-            raise Yt2BiliError("视频 ID 无效。")
-        return self.store.require(video_id)
+    def task(self, task_id):
+        if not isinstance(task_id, str) or len(task_id) > 100:
+            raise Yt2BiliError("任务 ID 无效。")
+        return self.store.require(task_id)
 
-    def ensure_inactive(self, video_id):
-        if video_id in self.scheduler.active:
+    def ensure_inactive(self, task_id):
+        task = self.task(task_id)
+        job = self.store.get_job(task.task_id) or {}
+        if job.get("owner_session_id") == self.scheduler.session_id and job.get("execution_state") in ("queued", "running", "waiting"):
             raise Yt2BiliError("任务正在执行，请先等待或取消。")
-
-    def ensure_login_finished(self):
-        if self.login and self.login.thread and self.login.thread.is_alive() and not self.login.cancelled.is_set():
-            raise Yt2BiliError("请先完成或关闭扫码登录，再开始任务。")
 
     def dispatch(self, method, params):
         if not isinstance(params, dict):
@@ -126,7 +120,14 @@ class DesktopService:
             "auth.login.cancel": self.login_cancel, "auth.renew": self.renew,
             "auth.import": self.import_cookies, "auth.youtube_export": self.export_youtube,
             "auth.clear": self.clear_auth,
-            "files.read_urls": self.read_urls, "data.import": self.import_data,
+            "data.import": self.import_data,
+            "accounts.list": lambda: {"items": self.accounts.list(True), "limit": 5},
+            "accounts.add": self.login_start, "accounts.rename": self.accounts.rename,
+            "accounts.archive": self.archive_account, "accounts.resume_uploads": self.resume_uploads,
+            "accounts.verify": self.accounts.verify,
+            "tasks.bind_legacy_account": self.bind_legacy,
+            "system.prepare_shutdown": self.prepare_shutdown,
+            "system.shutdown_status": self.scheduler.shutdown_status,
             "logs.tail": self.log_tail, "logs.export": self.log_export,
         }
         handler = handlers.get(method)
@@ -135,7 +136,9 @@ class DesktopService:
         return handler(**params)
 
     def health(self):
-        return {"protocol_version": 1, "version": "0.2.0-alpha.1", "queue": self.scheduler.snapshot(),
+        return {"protocol_version": 2, "schema_version": 2, "account_limit": 5,
+                "capabilities": ["single_url", "account_lanes", "graceful_shutdown"],
+                "migration_notes": self.migration_notes, "version": "0.2.0-alpha.1", "queue": self.scheduler.snapshot(),
                 "data_dir": str(self.paths.root)}
 
     def diagnostics(self):
@@ -183,107 +186,134 @@ class DesktopService:
         except Exception as exc:
             raise Yt2BiliError("DeepL 检测失败，请检查密钥、配额或网络。") from exc
 
-    def operation(self, operation_id, method, action):
+    def operation(self, operation_id, method, action, params=None, preflight=None):
         if not isinstance(operation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", operation_id):
             raise Yt2BiliError("缺少有效操作 ID。")
+        fingerprint = hashlib.sha256(json.dumps(params or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         with self.mutation:
-            previous = self.store.operation(operation_id, method)
+            previous = self.store.operation(operation_id, method, request_hash=fingerprint)
             if previous is not None:
                 return previous
-            result = action()
-            return self.store.operation(operation_id, method, result)
+            if self.scheduler.closing:
+                raise Yt2BiliError("应用正在退出。")
+            if preflight:
+                preflight()
+            with self.store.transaction():
+                previous = self.store.operation(operation_id, method, request_hash=fingerprint)
+                if previous is not None:
+                    return previous
+                result = action()
+                self.store.operation(operation_id, method, result, request_hash=fingerprint)
+            self.scheduler.signal.set()
+            return result
 
-    def create(self, text, operation_id, mode="preview"):
+    def create(self, url, operation_id, account_id=None, mode="preview"):
+        video_id, canonical = parse_single_video_url(url)
         if mode not in ("preview", "auto"):
             raise Yt2BiliError("任务模式无效。")
-        urls = parse_urls(text)
-        def action():
-            self.ensure_login_finished()
+        if not account_id or not isinstance(account_id, str):
+            raise Yt2BiliError("请选择本次投稿的 Bilibili 账号。")
+        def preflight():
+            account = self.store.account(account_id)
             if not self.config.key():
-                raise Yt2BiliError("请先在账号与连接中配置 DeepL 密钥。")
-            if mode == "auto" and not self.config.build().bili_cookies.is_file():
-                raise Yt2BiliError("自动投稿前请先登录 B 站。")
-            added, skipped = [], []
-            for video_id, url in urls:
-                old = self.store.get(video_id)
-                if old:
-                    skipped.append(video_id)
-                    continue
-                task = Task(video_id, url, "pending")
-                self.scheduler.add(task, mode)
-                added.append(video_id)
-            return {"added": added, "skipped": skipped}
-        return self.operation(operation_id, "tasks.create", action)
+                raise Yt2BiliError("请先配置 DeepL 密钥。")
+            if mode == "auto" and account["auth_state"] != "valid":
+                self.accounts.verify(account_id)
+        def action():
+            account = self.store.account(account_id)
+            old = self.store.for_account(video_id, account_id)
+            if old:
+                return {"task_id": old.task_id, "account_id": account_id, "created": False, "status": old.status}
+            task = Task(video_id, canonical, "pending", task_id=str(uuid.uuid4()), account_id=account_id,
+                        account_uid_snapshot=account["uid"], account_name_snapshot=account["nickname"] or account["uid"])
+            self.store.upsert(task)
+            self.scheduler.add(task, mode)
+            return {"task_id": task.task_id, "account_id": account_id, "created": True, "status": task.status}
+        return self.operation(operation_id, "tasks.create", action,
+                              {"url": canonical, "account_id": account_id, "mode": mode}, preflight)
 
-    def list_tasks(self, offset=0, limit=100, search="", status="", history=False):
+    def bind_legacy(self, task_id, account_id):
+        with self.mutation, self.store.transaction():
+            task = self.task(task_id)
+            self.ensure_inactive(task.task_id)
+            if task.account_id:
+                raise Yt2BiliError("已绑定账号的任务不能改投。")
+            account = self.store.account(account_id, active=task.status != "submitted")
+            if self.store.for_account(task.video_id, account_id):
+                raise Yt2BiliError("该账号已存在同视频任务，请保留并核对历史记录。")
+            task.account_id, task.account_uid_snapshot = account_id, account["uid"]
+            task.account_name_snapshot = account["nickname"] or account["uid"]
+            self.store.upsert(task)
+            return asdict(task)
+
+    def list_tasks(self, offset=0, limit=100, search="", status="", history=False, account_id=""):
         if type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= 200:
             raise Yt2BiliError("分页参数无效。")
         tasks = self.store.list_all()
         tasks = [item for item in tasks if (not search or search.lower() in (item.title_zh + item.title_orig + item.video_id).lower())
-                 and (not status or item.status == status)
+                 and (not account_id or item.account_id == account_id) and (not status or item.status == status)
                  and (not history or item.status in ("submitted", "submission_unknown"))]
         all_tasks = self.store.list_all()
-        return {"items": [{key: value for key, value in asdict(item).items() if key not in ("desc_orig", "desc_zh")} for item in tasks[offset:offset + limit]], "total": len(tasks),
+        return {"items": [{**{key: value for key, value in asdict(item).items() if key not in ("desc_orig", "desc_zh")},
+                           "run_id": (self.store.get_job(item.task_id) or {}).get("run_id")} for item in tasks[offset:offset + limit]], "total": len(tasks),
                 "counts": {name: sum(t.status == name for t in all_tasks) for name in ("downloading", "validating", "uploading", "ready", "submitted", "failed")},
-                "queue": self.scheduler.snapshot()}
+                "queue": self.scheduler.snapshot(), "all_total": len(all_tasks)}
 
-    def get_task(self, video_id):
-        task = self.task(video_id)
+    def get_task(self, task_id):
+        task = self.task(task_id)
         result = asdict(task)
-        result["snapshot"] = self.store.get_job(video_id)
+        result["snapshot"] = self.store.get_job(task_id)
+        result["run_id"] = (result["snapshot"] or {}).get("run_id")
         result["file_exists"] = bool(task.video_path and Path(task.video_path).is_file())
         return result
 
-    def retry(self, video_id, operation_id):
+    def retry(self, task_id, operation_id):
         def action():
-            self.ensure_login_finished()
-            task = self.task(video_id)
+            task = self.task(task_id)
             if task.status not in ("failed", "cancelled", "interrupted"):
                 raise Yt2BiliError("只有失败、取消或中断的任务可以继续；待核对投稿需先核对结果。")
-            snapshot = self.store.get_job(video_id) or {}
+            snapshot = self.store.get_job(task_id) or {}
             self.scheduler.add(task, "preview", snapshot.get("settings"))
             return {"queued": True}
-        return self.operation(operation_id, "tasks.retry", action)
+        return self.operation(operation_id, "tasks.retry", action, {"task_id": task_id})
 
-    def submit(self, video_id, operation_id):
+    def submit(self, task_id, operation_id):
         def action():
-            self.ensure_login_finished()
-            task = self.task(video_id)
+            task = self.task(task_id)
             if task.status != "ready":
                 raise Yt2BiliError("只有已准备好素材的任务可以确认投稿。")
-            if not self.config.build().bili_cookies.is_file():
-                raise Yt2BiliError("请先登录 B 站。")
-            saved = self.store.get_job(video_id) or {}
+            self.store.account(task.account_id)
+            saved = self.store.get_job(task_id) or {}
             self.scheduler.add(task, "submit", saved.get("settings"), stage="validate")
             return {"queued": True}
-        return self.operation(operation_id, "tasks.submit", action)
+        return self.operation(operation_id, "tasks.submit", action, {"task_id": task_id})
 
-    def cancel(self, video_id):
-        self.task(video_id)
-        self.scheduler.cancel(video_id)
+    def cancel(self, task_id):
+        self.task(task_id)
+        self.scheduler.cancel(task_id)
         return {"requested": True}
 
-    def repair(self, video_id, operation_id):
+    def repair(self, task_id, operation_id):
         def action():
-            self.ensure_login_finished()
-            task = self.task(video_id)
+            task = self.task(task_id)
             if task.status != "submitted" or not task.bv_id:
                 raise Yt2BiliError("修复用于已取得 BV 号的稿件；只准备本地替换文件。")
-            saved = self.store.get_job(video_id) or {}
+            saved = self.store.get_job(task_id) or {}
             self.scheduler.add(task, "preview", saved.get("settings"), repair=True)
             return {"queued": True}
-        return self.operation(operation_id, "tasks.repair", action)
+        return self.operation(operation_id, "tasks.repair", action, {"task_id": task_id})
 
-    def update_metadata(self, video_id, title, description):
+    def update_metadata(self, task_id, title, description):
         with self.mutation:
-            task = self.task(video_id)
-            self.ensure_inactive(video_id)
+            task = self.task(task_id)
+            self.ensure_inactive(task_id)
             if task.status != "ready":
                 raise Yt2BiliError("素材准备完成后才可编辑。")
             if not isinstance(title, str) or not 1 <= len(title.strip()) <= 80:
                 raise Yt2BiliError("标题须为 1～80 字。")
             if not isinstance(description, str) or len(description) > 2000:
                 raise Yt2BiliError("简介不能超过 2000 字。")
+            task.metadata_revision += 1
             task.title_zh = title.strip().replace("\n", " ")
             body = description.split("\n\n————————\n原标题：")[0]
             task.desc_zh = translate.build_description(body, task.title_orig, task.uploader, task.url, 2000)
@@ -292,10 +322,10 @@ class DesktopService:
                 (Path(task.work_dir) / name).write_text(content, encoding="utf-8")
             return asdict(task)
 
-    def resolve(self, video_id, bv_id="", not_submitted=False):
+    def resolve(self, task_id, bv_id="", not_submitted=False):
         with self.mutation:
-            task = self.task(video_id)
-            self.ensure_inactive(video_id)
+            task = self.task(task_id)
+            self.ensure_inactive(task_id)
             if task.status != "submission_unknown":
                 raise Yt2BiliError("此任务无需核对投稿结果。")
             if not_submitted is True:
@@ -308,8 +338,8 @@ class DesktopService:
             self.store.upsert(task)
             return asdict(task)
 
-    def cover(self, video_id):
-        task = self.task(video_id)
+    def cover(self, task_id):
+        task = self.task(task_id)
         if not task.cover_path or not task.work_dir:
             return {"image": None}
         file = Path(task.cover_path).resolve()
@@ -321,8 +351,8 @@ class DesktopService:
             image.convert("RGB").save(buffer, "JPEG", quality=80)
         return {"image": "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()}
 
-    def open_folder(self, video_id):
-        task = self.task(video_id)
+    def open_folder(self, task_id):
+        task = self.task(task_id)
         path = Path(task.work_dir) if task.work_dir else None
         if not path or not path.is_dir():
             raise Yt2BiliError("素材目录已清理或不存在。")
@@ -333,55 +363,97 @@ class DesktopService:
             subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
         return {"opened": True}
 
-    def auth_status(self, verify=False):
-        return {**account_status(self.paths.root / "secrets/bili_cookies.json", verify), "login": self.auth_state}
+    def auth_status(self, verify=False, account_id=None):
+        if verify and account_id:
+            self.accounts.verify(account_id)
+        items = self.accounts.list()
+        return {"accounts": items, "limit": 5, "configured": bool(items),
+                "login": self.auth_state}
 
-    def login_start(self):
-        with self.mutation:
-            self.ensure_idle()
-            self.login_cancel()
-            self.auth_state = {"status": "loading"}
-            self.login = LoginSession(self.paths.root / "secrets/bili_cookies.json", self.emit)
-            return self.login.start()
+    def login_start(self, account_id=None):
+        if self.scheduler.closing:
+            raise Yt2BiliError("应用正在退出。")
+        if account_id:
+            self.store.account(account_id)
+        elif len(self.accounts.list()) >= 5:
+            raise Yt2BiliError("最多支持 5 个 Bilibili 账号。")
+        self.login_cancel()
+        self.auth_state = {"status": "loading", "account_id": account_id}
+        self.login = LoginSession(None, self.emit, account_id=account_id,
+                                  commit=lambda info: self.accounts.bind(info, account_id))
+        return self.login.start()
 
-    def login_cancel(self):
-        if self.login:
+    def login_cancel(self, session_id=None, account_id=None):
+        if self.login and (not session_id or self.login.session_id == session_id):
             self.login.cancel()
-        self.auth_state = {"status": "idle"}
+            self.auth_state = {"status": "idle"}
         return {"cancelled": True}
 
-    def renew(self):
-        with self.mutation:
-            self.ensure_idle()
-            bili_upload.renew(self.config.build())
-            return self.auth_status(verify=True)
+    def renew(self, account_id):
+        account = self.store.account(account_id)
+        with account_guard(account["uid"]):
+            account, info = self.accounts.read(account_id)
+            temporary = self.paths.root / "secrets/bilibili" / account_id / ("renew-" + str(uuid.uuid4()) + ".json")
+            try:
+                atomic_json(temporary, info)
+                bili_upload.renew(replace(self.config.build(), bili_cookies=temporary))
+                self.accounts.bind(json.loads(temporary.read_text(encoding="utf-8")), account_id, locked=True)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return self.auth_status()
 
-    def import_cookies(self, path, kind):
+    def import_cookies(self, path, kind, account_id=None):
+        source = Path(path)
+        if not source.is_file() or source.stat().st_size > 5_000_000:
+            raise Yt2BiliError("Cookie 文件不存在或过大。")
+        content = source.read_text(encoding="utf-8-sig")
+        if kind == "bilibili":
+            result = self.accounts.bind(validate_login(json.loads(content)), account_id)
+            return {"imported": True, "account_id": result["account_id"]}
+        if kind != "youtube":
+            raise Yt2BiliError("不支持的 Cookie 类型。")
         with self.mutation:
             self.ensure_idle()
-            source = Path(path)
-            if not source.is_file() or source.stat().st_size > 5_000_000:
-                raise Yt2BiliError("Cookie 文件不存在或过大。")
-            content = source.read_text(encoding="utf-8-sig")
-            if kind == "bilibili":
-                self.login_cancel()
-                atomic_json(self.paths.root / "secrets/bili_cookies.json", validate_login(json.loads(content)))
-            elif kind == "youtube":
-                import http.cookiejar
-                jar = http.cookiejar.MozillaCookieJar(str(source))
-                try:
-                    jar.load(ignore_discard=True, ignore_expires=True)
-                except Exception as exc:
-                    raise Yt2BiliError("请使用 Netscape 格式的 YouTube Cookie 文件。") from exc
-                target = self.paths.root / "secrets/youtube_cookies.txt"
-                temporary = target.with_suffix(".tmp")
-                temporary.write_text(content, encoding="utf-8")
-                temporary.replace(target)
-                if os.name != "nt":
-                    target.chmod(0o600)
-            else:
-                raise Yt2BiliError("不支持的 Cookie 类型。")
+            import http.cookiejar
+            jar = http.cookiejar.MozillaCookieJar(str(source))
+            try:
+                jar.load(ignore_discard=True, ignore_expires=True)
+            except Exception as exc:
+                raise Yt2BiliError("请使用 Netscape 格式的 YouTube Cookie 文件。") from exc
+            target = self.paths.root / "secrets/youtube_cookies.txt"
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(target)
+            if os.name != "nt":
+                target.chmod(0o600)
             return {"imported": True}
+
+    def archive_account(self, account_id):
+        with self.mutation:
+            return self.accounts.archive(account_id)
+
+    def resume_uploads(self, account_id, confirmed_no_upload=False):
+        account = self.store.account(account_id)
+        if confirmed_no_upload is not True:
+            raise Yt2BiliError("请先核对没有仍在运行的投稿进程及该账号创作中心。")
+        with account_guard(account["uid"]):
+            marker = coordination_dir(account["uid"]) / "attempt-state.json"
+            from yt2bili.process_manager import process_alive
+            try:
+                state = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {}
+            except (OSError, ValueError):
+                state = {}
+            if state.get("inflight") and (process_alive(state.get("child_pid")) or process_alive(state.get("owner_pid"))):
+                raise Yt2BiliError("检测到原投稿进程仍可能运行，不能恢复；请先结束原实例并核对。")
+            # Explicit user confirmation only; unknown tasks remain frozen.
+            import time
+            atomic_json(marker, {"ended": time.time()})
+        self.scheduler.sync_accounts(account_id)
+        return {"resumed": True}
+
+    def prepare_shutdown(self):
+        self.login_cancel()
+        return self.scheduler.prepare_shutdown()
 
     def export_youtube(self, browser="edge"):
         with self.mutation:
@@ -393,60 +465,85 @@ class DesktopService:
             youtube.export_browser_cookies(settings, browser)
             return {"exported": True}
 
-    def clear_auth(self, kind):
+    def clear_auth(self, kind, account_id=None):
+        if kind == "bilibili":
+            return self.accounts.clear(account_id)
+        if kind != "youtube":
+            raise Yt2BiliError("账号类型无效。")
         with self.mutation:
             self.ensure_idle()
-            names = {"bilibili": "bili_cookies.json", "youtube": "youtube_cookies.txt"}
-            if kind not in names:
-                raise Yt2BiliError("账号类型无效。")
-            self.login_cancel()
-            (self.paths.root / "secrets" / names[kind]).unlink(missing_ok=True)
-            return {"cleared": True}
-
-    def read_urls(self, path):
-        file = Path(path)
-        if file.suffix.lower() != ".txt" or file.stat().st_size > 250_000:
-            raise Yt2BiliError("请选择小于 250 KB 的 TXT 文件。")
-        text = file.read_text(encoding="utf-8-sig")
-        parse_urls(text)
-        return {"text": text}
+            (self.paths.root / "secrets/youtube_cookies.txt").unlink(missing_ok=True)
+        return {"cleared": True}
 
     def import_data(self, path):
         with self.mutation:
             self.ensure_idle()
             source = Path(path).resolve()
             db = source / "data/tasks.sqlite"
-            if not db.is_file():
-                raise Yt2BiliError("所选目录没有 data/tasks.sqlite。")
-            backup = self.paths.root / "data/import-backup.sqlite"
-            with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as old, closing(sqlite3.connect(backup)) as target:
-                old.backup(target)
+            if not db.is_file() or db.resolve() == self.store.path.resolve():
+                raise Yt2BiliError("请选择另一个有效项目的数据目录。")
+            with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as old:
+                version = old.execute("PRAGMA user_version").fetchone()[0]
+                if version > 2:
+                    raise Yt2BiliError("不支持的来源数据库版本。")
                 old.row_factory = sqlite3.Row
-                rows = old.execute("SELECT * FROM tasks").fetchall()
-            imported = 0
-            for row in rows:
-                if not VIDEO_ID.fullmatch(row["video_id"]) or self.store.get(row["video_id"]):
-                    continue
-                task = Task(**{name: row[name] for name in Task.__dataclass_fields__})
-                if task.work_dir:
-                    expected = (source / "work" / task.video_id).resolve()
-                    if Path(task.work_dir).resolve() != expected:
-                        task.work_dir = task.video_path = task.cover_path = ""
-                    else:
-                        for attr in ("video_path", "cover_path"):
-                            if getattr(task, attr) and expected not in Path(getattr(task, attr)).resolve().parents:
-                                setattr(task, attr, "")
-                if task.status == "uploading" or (task.status == "submitted" and not task.bv_id):
-                    task.status = "submission_unknown"
-                elif task.status not in ("submitted", "ready", "failed", "cancelled", "submission_unknown"):
-                    task.status = "interrupted"
-                self.store.upsert(task)
-                imported += 1
-            return {"imported": imported, "note": "只导入任务记录，素材保留原位，账号和密钥需单独配置。"}
+                rows = [dict(r) for r in old.execute("SELECT * FROM tasks")]
+            source_id = hashlib.sha256(str(db).encode()).hexdigest()
+            imported, conflicts = 0, 0
+            with self.store.transaction() as conn:
+                for row in rows:
+                    if not VIDEO_ID.fullmatch(row["video_id"]):
+                        continue
+                    legacy_id = row.get("task_id") or row["video_id"]
+                    if conn.execute("SELECT 1 FROM legacy_task_map WHERE source_id=? AND legacy_id=?", (source_id, legacy_id)).fetchone():
+                        continue
+                    task = Task(**{k: v for k, v in row.items() if k in Task.__dataclass_fields__})
+                    task.task_id = str(uuid.uuid4())
+                    target = next((a for a in self.store.accounts(True) if version == 2 and a["uid"] == row.get("account_uid_snapshot")), None)
+                    task.account_id = target["account_id"] if target else None
+                    task.account_uid_snapshot = target["uid"] if target else None
+                    task.account_name_snapshot = (target["nickname"] or target["uid"]) if target else ""
+                    existing = self.store.for_account(task.video_id, task.account_id) if target else None
+                    if existing:
+                        conn.execute("INSERT OR IGNORE INTO import_conflicts VALUES(?,?,?,?)",
+                                     (source_id, legacy_id, json.dumps(row, ensure_ascii=False), existing.task_id))
+                        conflicts += 1
+                        continue
+                    task.cancel_requested = 0
+                    if task.work_dir:
+                        candidate = source / "work" / (legacy_id if version == 2 else task.video_id)
+                        expected = candidate.resolve()
+                        if Path(task.work_dir).resolve() != expected or candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()) or not expected.is_dir():
+                            task.work_dir = task.work_root = task.video_path = task.cover_path = ""
+                        else:
+                            destination = Path(self.config.values["work_dir"]) / task.task_id
+                            with work_lock(expected):
+                                unsafe = any(p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()) for p in expected.rglob("*"))
+                                if unsafe:
+                                    raise Yt2BiliError("来源素材含目录跳转，请先整理素材后导入。")
+                                shutil.copytree(expected, destination)
+                            task.work_root, task.work_dir = str(destination.parent), str(destination)
+                            for attr in ("video_path", "cover_path"):
+                                if getattr(task, attr) and expected not in Path(getattr(task, attr)).resolve().parents:
+                                    setattr(task, attr, "")
+                                elif getattr(task, attr):
+                                    setattr(task, attr, str(destination / Path(getattr(task, attr)).resolve().relative_to(expected)))
+                    if task.status == "ready" and not task.work_dir:
+                        task.status = "interrupted"
+                    if task.status == "uploading" or task.status == "submitted" and not task.bv_id:
+                        task.status = "submission_unknown"
+                    elif task.status not in ("submitted", "ready", "failed", "cancelled", "submission_unknown"):
+                        task.status = "interrupted"
+                    self.store.upsert(task)
+                    conn.execute("INSERT INTO legacy_task_map VALUES(?,?,?)", (source_id, legacy_id, task.task_id))
+                    imported += 1
+            return {"imported": imported, "conflicts": conflicts, "note": "素材复制到独立任务目录，源文件保留；未知归属请人工确认，未导入凭据。"}
 
-    def log_tail(self, video_id=None):
+    def log_tail(self, task_id=None, account_id=None):
         with self.logs_lock:
-            return {"items": [entry for entry in self.logs if not video_id or entry.get("video_id") == video_id][-300:]}
+            return {"items": [entry for entry in self.logs
+                             if (not task_id or entry.get("task_id") == task_id)
+                             and (not account_id or entry.get("account_id") == account_id)][-300:]}
 
     def log_export(self, path):
         target = Path(path)
@@ -467,6 +564,10 @@ class DesktopService:
         return {"exported": True}
 
     def close(self):
+        if self._closed:
+            return
         self.login_cancel()
         self.scheduler.close()
         self.store.close()
+        self.owner_lock.__exit__(None, None, None)
+        self._closed = True

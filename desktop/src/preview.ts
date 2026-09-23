@@ -14,6 +14,22 @@ const config = {
   youtube_cookies: false,
   vault_error: "",
 };
+const number = Math.min(
+  5,
+  Math.max(
+    0,
+    Number(new URLSearchParams(location.search).get("accounts") || 0),
+  ),
+);
+const accounts = Array.from({ length: number }, (_, i) => ({
+  account_id: `account-${i + 1}`,
+  uid: String(10001 + i),
+  nickname: `账号 ${i + 1}`,
+  remark: "",
+  lifecycle: "active",
+  slot: i + 1,
+  auth_state: "valid",
+}));
 let tasks: Task[] = [];
 if (new URLSearchParams(location.search).has("populated"))
   tasks = [
@@ -40,6 +56,11 @@ if (new URLSearchParams(location.search).has("populated"))
     },
   ].map((t) => ({
     ...t,
+    task_id: t.video_id,
+    account_id: accounts[0]?.account_id || null,
+    account_uid_snapshot: accounts[0]?.uid || null,
+    account_name_snapshot: accounts[0]?.nickname || "",
+    revision: 1,
     url: `https://www.youtube.com/watch?v=${t.video_id}`,
     desc_orig: "An exploration of thoughtful tools and creative work.",
     desc_zh: "探索更简单的工具与创作方式。",
@@ -51,15 +72,28 @@ if (new URLSearchParams(location.search).has("populated"))
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }));
+if (new URLSearchParams(location.search).has("samevideo") && tasks.length)
+  tasks = accounts.map((a) => ({
+    ...tasks[0],
+    task_id: a.account_id + "-samevideo",
+    account_id: a.account_id,
+    account_uid_snapshot: a.uid,
+    account_name_snapshot: a.nickname,
+  }));
 export async function request(method: string, params: any): Promise<any> {
-  if (method === "system.health") return { protocol_version: 1 };
+  if (method === "system.health") return { protocol_version: 2 };
   if (method === "settings.get") return { ...config };
   if (method === "settings.update") {
     Object.assign(config, params.values);
     return { ...config };
   }
   if (method === "auth.status")
-    return { configured: false, login: { status: "idle" } };
+    return {
+      accounts,
+      configured: accounts.length > 0,
+      login: { status: "idle" },
+    };
+  if (method === "accounts.list") return { items: accounts, limit: 5 };
   if (method === "auth.login.cancel") return { cancelled: true };
   if (method === "system.diagnostics")
     return {
@@ -74,6 +108,7 @@ export async function request(method: string, params: any): Promise<any> {
   if (method === "tasks.list") {
     const items = tasks.filter(
       (t) =>
+        (!params.account_id || t.account_id === params.account_id) &&
         (!params.history || t.status === "submitted") &&
         (!params.status || params.status === t.status) &&
         (!params.search || t.title_zh.includes(params.search)),
@@ -81,19 +116,29 @@ export async function request(method: string, params: any): Promise<any> {
     return {
       items,
       total: items.length,
+      all_total: tasks.length,
       counts: {
         ready: tasks.filter((t) => t.status === "ready").length,
         validating: tasks.filter((t) => t.status === "validating").length,
       },
-      queue: { active: [] },
+      queue: {
+        active: [],
+        download: {},
+        validate: {},
+        uploads: accounts.map((a) => ({
+          account_id: a.account_id,
+          queued_count: 0,
+        })),
+      },
     };
   }
   if (method === "tasks.get")
-    return tasks.find((t) => t.video_id === params.video_id);
+    return tasks.find((t) => t.task_id === params.task_id);
   if (method === "tasks.cover") return { image: null };
   if (method === "logs.tail") return { items: [] };
   if (method === "tasks.update_metadata") {
-    const task = tasks.find((t) => t.video_id === params.video_id)!;
+    const task = tasks.find((t) => t.task_id === params.task_id)!;
+    task.revision += 1;
     task.title_zh = params.title;
     task.desc_zh = params.description;
     return task;

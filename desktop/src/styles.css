@@ -1371,3 +1371,10 @@ pre {
     transition: none !important;
   }
 }
+.queue-overview { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin:16px 0; }
+.queue-card { border:1px solid var(--border); border-radius:10px; padding:12px; min-width:0; }
+.queue-card strong,.queue-card small { display:block; overflow-wrap:anywhere; }
+.queue-card small { margin-top:6px; opacity:.7; }
+.account-row { border-bottom:1px solid var(--border); padding:16px 0; margin-bottom:12px; }
+.account-row .button-row { flex-wrap:wrap; margin-top:12px; }
+.account-row button { padding:6px 10px; border-radius:6px; }

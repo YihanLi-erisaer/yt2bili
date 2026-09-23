@@ -16,6 +16,7 @@ from yt2bili import events
 from yt2bili.exceptions import Yt2BiliError
 from yt2bili.locking import FileLock
 from yt2bili.paths import AppPaths
+from yt2bili.process_manager import own_children
 
 
 MAX_MESSAGE = 1_048_576
@@ -42,7 +43,7 @@ class DesktopLogHandler(logging.Handler):
                 match = re.search(r"\[([A-Za-z0-9_-]{11})\]", message)
                 video_id = match.group(1) if match else None
             self.service.add_log({"time": time.strftime("%H:%M:%S"), "level": record.levelname,
-                                  "video_id": video_id, "message": message})
+                                  "video_id": video_id, **events.current_identity(), "message": message})
             safe = logging.LogRecord(record.name, record.levelno, "", 0, message, (), None)
             self.file_handler.emit(safe)
         except Exception:
@@ -51,7 +52,7 @@ class DesktopLogHandler(logging.Handler):
 
 class Protocol:
     def __init__(self, stream):
-        self.stream, self.lock = stream, threading.Lock()
+        self.stream, self.lock = stream, threading.RLock()
         self.session_id = str(uuid.uuid4())
         self.sequence = 0
 
@@ -65,13 +66,13 @@ class Protocol:
         with self.lock:
             self.sequence += 1
             sequence = self.sequence
-        self.write({"protocol_version": 1, "event": event, "event_id": sequence,
-                    "worker_session_id": self.session_id, "time": time.time(), "payload": payload})
+            self.write({"protocol_version": 2, "event": event, "event_id": sequence,
+                        "worker_session_id": self.session_id, "time": time.time(), "payload": payload})
 
     def handle(self, service, request):
         request_id = request.get("request_id") if isinstance(request, dict) else None
         try:
-            if not isinstance(request, dict) or request.get("protocol_version") != 1:
+            if not isinstance(request, dict) or request.get("protocol_version") != 2:
                 raise Yt2BiliError("协议版本不兼容。")
             if not isinstance(request_id, str) or len(request_id) > 100:
                 raise Yt2BiliError("缺少有效请求 ID。")
@@ -98,7 +99,7 @@ def main():
         from yt2bili.desktop_selftest import run
         protocol.write(run(paths))
         return 0
-    with FileLock(paths.root / "desktop.lock"):
+    with own_children(), FileLock(paths.root / "desktop.lock"):
         from yt2bili.desktop_service import DesktopService
         service = DesktopService(paths, protocol.emit)
         file_handler = logging.handlers.RotatingFileHandler(paths.root / "logs/desktop.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")

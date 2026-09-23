@@ -16,20 +16,27 @@ _local = threading.local()
 
 
 @contextmanager
-def task_context(video_id, cancel, emit):
+def task_context(video_id, cancel, emit, *, task_id=None, account_id=None, run_id=None):
     previous = getattr(_local, "context", None)
     _local.context = (video_id, cancel, emit)
+    previous_identity = getattr(_local, "identity", {})
+    _local.identity = {"task_id": task_id or video_id, "account_id": account_id, "run_id": run_id}
     _local.last_progress = 0.0
     try:
         check_cancelled()
         yield
     finally:
         _local.context = previous
+        _local.identity = previous_identity
+
+
+def current_identity():
+    return dict(getattr(_local, "identity", {}))
 
 
 def check_cancelled():
     context = getattr(_local, "context", None)
-    if context and context[1].is_set():
+    if context and context[1] is not None and context[1].is_set():
         raise Cancelled("任务已取消，已保留可恢复的素材。")
 
 
@@ -52,7 +59,7 @@ def progress(stage, *, force=False, **payload):
     if not force and now - getattr(_local, "last_progress", 0) < 0.25:
         return
     _local.last_progress = now
-    context[2]("task.progress", {"video_id": context[0], "stage": stage, **payload})
+    context[2]("task.progress", {"video_id": context[0], **current_identity(), "stage": stage, **payload})
 
 
 def download_progress(data):

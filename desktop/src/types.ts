@@ -1,4 +1,11 @@
 export interface Task {
+  task_id: string;
+  account_id: string | null;
+  account_uid_snapshot: string | null;
+  account_name_snapshot: string;
+  revision: number;
+  run_id?: string;
+  wait_reason?: string;
   video_id: string;
   url: string;
   status: string;
@@ -32,6 +39,8 @@ export interface Config {
   vault_error: string;
 }
 export interface Progress {
+  task_id?: string;
+  run_id?: string;
   stage: string;
   percent?: number | null;
   speed?: number;
@@ -78,3 +87,14 @@ export function bytes(value: number) {
     ? `${(value / 1024 ** 3).toFixed(1)} GB`
     : `${(value / 1024 ** 2).toFixed(1)} MB`;
 }
+export interface BiliAccount {
+  account_id: string;
+  uid: string;
+  nickname: string;
+  remark: string;
+  lifecycle: string;
+  slot: number | null;
+  auth_state: string;
+}
+export const accountLabel = (a: BiliAccount) =>
+  `${a.remark || a.nickname || "Bilibili"} · UID ${a.uid}`;

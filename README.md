@@ -45,56 +45,43 @@ python -m yt2bili setup
 
 这会把官方 [biliupR](https://github.com/biliup/biliup/releases/latest)（原 biliup-rs）放到 `bin\biliup.exe`。也可以自己下载 `biliupR-*-x86_64-windows.zip`，把 `biliup.exe` 放进 `bin\`。
 
-B 站扫码登录（Cookie 写到 `secrets\bili_cookies.json`，已在 `.gitignore` 中）：
+添加 Bilibili 账号（最多 5 个不同 UID，凭据保存在忽略提交的 secrets 目录）：
 
 ```powershell
-python -m yt2bili login
+python -m yt2bili accounts add
+python -m yt2bili accounts list
 ```
-
-用手机 B 站 App 扫码并确认。
 
 ## 使用
 
-先试跑（下载、封面、翻译，不投稿）：
+每次只输入一个 YouTube 视频链接，必须用 `--account` 选择账号。默认只准备素材，完成后在桌面预览编辑并确认投稿；也可用 CLI 确认：
 
 ```powershell
-python -m yt2bili run "https://www.youtube.com/watch?v=xxxxxxxxxxx" --dry-run
+python -m yt2bili run "https://www.youtube.com/watch?v=xxxxxxxxxxx" --account ACCOUNT_ID
+python -m yt2bili submit TASK_ID
 ```
 
-确认标题和简介没问题后再投稿：
+明确需要自动投稿时增加 `--auto`。不再支持多 URL、TXT 列表、`--file` 或 `--force`。同视频同账号返回原任务，同视频可分别创建到不同账号。
 
 ```powershell
-python -m yt2bili run "https://www.youtube.com/watch?v=xxxxxxxxxxx"
-```
-
-一次处理多条（三阶段独立队列，各阶段单路）：
-
-```powershell
-python -m yt2bili run "https://www.youtube.com/watch?v=aaa" "https://www.youtube.com/watch?v=bbb"
-```
-
-或从文本文件读取链接（每行一条，`#` 开头为注释）：
-
-```powershell
-python -m yt2bili run --file urls.txt
-```
-
-失败后续跑（不会无故重下已有的 `video.mp4`）：
-
-```powershell
-python -m yt2bili retry VIDEO_ID
-```
-
-video_id 以 `-` 开头时也可以直接写，例如 `python -m yt2bili retry -GiIT0fNvW8`。
-
-其它命令：
-
-```powershell
+python -m yt2bili run "https://youtu.be/xxxxxxxxxxx" --account ACCOUNT_ID --auto
+python -m yt2bili retry TASK_ID
+python -m yt2bili repair TASK_ID
+python -m yt2bili login --account ACCOUNT_ID
+python -m yt2bili renew --account ACCOUNT_ID
+python -m yt2bili accounts archive --account ACCOUNT_ID
 python -m yt2bili list
-python -m yt2bili renew
 ```
 
-产物在 `work\<video_id>\`，任务记录在 `data\tasks.sqlite`。
+重试始终回到预览，目标账号不能改变。归档只允许该账号全部任务已提交；清除登录凭据仍占账号名额。重新添加已归档的 UID 会恢复原账号身份。
+
+新素材目录为 `work/<task_id>/`，历史视频 ID 有且仅有一个匹配时才允许作为 CLI 参数。GUI 与 CLI 不能同时执行同一个数据目录；指定同一份库时先退出桌面：
+
+```powershell
+python -m yt2bili --data-dir "C:\\path\\to\\profile" list
+```
+
+启动会备份旧数据库并升级到 schema v2。旧任务不会自动判断历史投稿账号，需在桌面详情中一次性绑定。旧 Cookie 能确定本地 UID 时仅导入为待验证账号，原文件保留。新旧版本不支持混跑；回滚需先另存升级后的数据库，再恢复升级前备份及对应旧版本，不能直接降低 schema 版本号。备份后新增任务不在旧库中，素材目录应保留。
 
 ## 默认投稿参数
 
@@ -106,8 +93,8 @@ python -m yt2bili renew
 | 创作声明 | 内容无需标注（Web 投稿，不勾选自制禁转） | 固定 |
 | 分辨率 | 源站最高可用画质（含 4K）。禁止嵌入的视频可能只能下到 1080p | 无上限 |
 | 时长 | 不限制 | — |
-| 队列并发 | 下载、校验处理、上传各固定 1 路，跨阶段并行 | 旧 `-j` / `DOWNLOAD_JOBS` 不再增加并发 |
-| 上传间隔 | 上一次上传尝试结束后至少 20 秒再开始下一次 | `.env` 里 `UPLOAD_GAP_SECONDS` |
+| 队列并发 | 下载、校验各共享 1 路；每账号上传 1 路，最多 5 路 | 账号队列自动创建 |
+| 上传间隔 | 同 UID 上一次上传尝试结束后至少 20 秒再开始下一次 | `.env` 里 `UPLOAD_GAP_SECONDS` |
 
 YouTube 现在要求 JS 运行时才能完整解析。本机有 Node.js 或 Deno 即可（`setup` 会检测）。若出现「Sign in to confirm you’re not a bot」，先完全退出 Edge/Chrome，再导出 cookies：
 
@@ -125,19 +112,15 @@ python -m yt2bili youtube-cookies
 4. DeepL Free 翻译标题和简介（已是中文则跳过），标题截到 80 字  
 5. 调用 `biliup upload` 提交稿件（创作声明：内容无需标注）  
 
-`--dry-run` 在第 5 步之前停下并保留文件。Cookie 过期时重新 `login`。上传成功并获得 BV 号后，自动删除当前任务的 `work\<video_id>\` 目录（含源视频、封面、临时文件及隔离的旧文件），保留数据库中的任务记录和 BV 号。上传失败或未解析到 BV 号时保留文件；清理失败也不会把已提交的任务改成上传失败。投稿成功不代表平台转码或审核成功，删除后若平台处理失败，需要重新下载。
+`--dry-run` 在第 5 步之前停下并保留文件。Cookie 过期时使用 `login --account ACCOUNT_ID`。上传成功并获得 BV 号后，自动删除当前任务的 `work\<video_id>\` 目录（含源视频、封面、临时文件及隔离的旧文件），保留数据库中的任务记录和 BV 号。上传失败或未解析到 BV 号时保留文件；清理失败也不会把已提交的任务改成上传失败。投稿成功不代表平台转码或审核成功，删除后若平台处理失败，需要重新下载。
 
 平台转码失败时，可生成完整、兼容的替换文件，命令不会重复投稿或修改原 BV 号：
 
 ```powershell
-python -m yt2bili repair --redownload bHEuq3isf9M hQ0JDjDFJE0
+python -m yt2bili repair TASK_ID
 ```
 
-旧文件保留在各任务的 `rejected/` 下；修复并完整校验成功后，使用日志显示的文件路径在 B 站创作中心替换原稿件的视频（直接复用 MP4 时通常为 `work\<video_id>\source.mp4`）。`repair` 不上传、不触发上传后清理。省略 `--redownload` 会先校验并尝试复用已有完整文件。完整解码校验仍会运行 FFmpeg，但不会生成转码视频。
-
-只有非 MP4 需要转换时，`repair --encoder h264_nvenc` 才会使用 NVIDIA 编码加速，默认使用 CPU 的 `libx264`。这些选项不会强制转换已有 MP4。修复中断后去掉 `--redownload` 重新执行以续传。
-
-可加 `--max-size-gb 8` 检查每个文件不超过 8 GB（十进制，非对平台限制的声明）。MP4 超限会报错，不自动压缩或转码；非 MP4 转换时按时长限制码率并保留分辨率。默认不限制大小。
+修复会先尝试复用本任务完整素材，缺失或损坏时重新准备。成功后使用日志显示的路径在创作中心替换原稿件视频；不上传、不修改 BV、不触发成功清理。
 
 完整校验默认优先尝试 NVIDIA GPU 解码（当前支持普通 8-bit 4:2:0 的 AV1/H.264/VP9）；没有可用设备、驱动/解码器不支持或 GPU 校验出错时，自动从头用 CPU 复核。其它格式使用 CPU，音频也使用 CPU。无需手动设置环境变量。可设置 `$env:YT2BILI_HWACCEL='cpu'` 强制 CPU，或设为 `'auto'` 恢复自动选择。CPU 处理 AV1 时建议使用包含 `libdav1d` 的 FFmpeg full 构建。
 
@@ -147,14 +130,14 @@ python -m yt2bili repair --redownload bHEuq3isf9M hQ0JDjDFJE0
 
 `.part` 文件只由 yt-dlp 续传、完成后改名，程序不再根据文件头的时长把它提前当作成品。分片下载失败、解码报错、音视频长度不匹配会阻止上传。FFmpeg 可安装到 PATH，也可将 `ffmpeg.exe` 和 `ffprobe.exe` 放在项目 `bin/` 中。
 
-批量传入多条链接（或使用 `--file`）时，使用三个独立 FIFO 工作队列，每个队列固定一个工作线程，各阶段之间可并行，不再限制“同时只有两个视频任务”：
+任务使用两个共享队列及 0～5 个账号上传队列：
 
-- 下载队列：解析信息、下载、合并；结束后立即把文件交给校验队列，并开始下一条下载，不等待前一条校验或上传。
-- 校验队列：GPU/CPU 完整校验（含持久化缓存检查）。校验通过后交给上传队列，立即校验下一份已下载文件，不等待封面处理、翻译或上传。
-- 上传队列：准备封面和翻译后逐条上传。上一次上传尝试结束后至少间隔 20 秒再开始下一次；若素材准备等已经耗尽间隔，不再额外等待。上传等待不阻塞另外两个队列。取得 BV 号后清理当前任务文件。
+- 下载队列负责解析、下载、合并，完成后即处理下一条。
+- 校验队列保留完整解码、GPU/CPU 复核及缓存逻辑。校验失败隔离旧文件并回到下载队尾，最多五轮。
+- 每个账号单独准备封面、翻译和上传。等待登录、冷却或限流不会占用其他账号；等待期间该账号后续预览任务仍可准备。
 
-因此 A 正在上传、B 正在校验时，C 可以下载；C 下载完后，D 也可以继续下载，即使 A、B 都没结束。逐帧校验仍由独立 FFmpeg 子进程执行。排队中的文件会保留在磁盘上；当下载快于校验或上传时，文件可能积压，请预留足够磁盘空间。
+账号间可同时上传，同 UID 即使使用不同 profile 或 Cookie 路径也共享操作系统锁与冷却时间。未知投稿必须先核对创作中心，不会自动重发；异常退出后其他未完成任务也需手动继续。正常退出会取消未投稿任务并等待所有在途投稿结束。
 
-校验失败会隔离损坏文件并退回下载队列重新排队，最多进行 5 轮下载/校验，仍失败则保留失败记录，不会提前上传。某条下载、准备或上传失败不会中断其它任务。列表中指向同一视频 ID 的不同链接也会去重，避免同一目录被重复处理。`list` 可看到 `queued_validation`、`validating`、`queued_upload` 等状态。GPU/CPU 校验进度约每 5 秒输出一次，包含视频 ID、轨道、已检查时长和百分比；命中缓存时只提示跳过重复解码。已经投稿成功的视频在批量模式下会跳过（单条仍会报错，可用 `--force` 重做）。
+`accounts.resume_uploads`（桌面“恢复上传”）用于人工核对后的限流或异常占用恢复。残留上传进程仍存在时拒绝恢复；恢复队列不会解除任务自身的“待核对”保护。
 
-非正式会员大约每天最多 5 条；上传过快会被限流，稍等再 `retry`。不要对同一账号并行打开多个上传进程。
+完整设计见 [PRD](docs/多账号上传与单链接任务PRD.md) 和 [技术实现方案](docs/多账号上传与单链接任务技术实现方案.md)。真实平台五账号验收与自动化模拟验证分开记录。

@@ -112,6 +112,7 @@ def upload(
     title: str,
     description: str,
     source_url: str,
+    on_started=None,
 ) -> str:
     biliup = find_biliup(settings)
     _require_cookies(settings)
@@ -153,7 +154,7 @@ def upload(
             settings.bili_tid,
             line_name,
         )
-        code, output = _run_logged(cmd)
+        code, output = _run_logged(cmd, on_started=on_started) if on_started else _run_logged(cmd)
         last_output = output
         if code == 0:
             bv = _parse_bv(output)
@@ -162,7 +163,7 @@ def upload(
                 return bv
             logger.info("投稿命令成功，但输出里没有解析到 BV 号。")
             return ""
-        if _is_cert_failure(output):
+        if _is_cert_failure(output) and not on_started:
             logger.warning("线路 %s TLS 校验失败，尝试下一条上传线路。", line_name)
             continue
         raise Yt2BiliError(
@@ -191,7 +192,7 @@ def _is_cert_failure(output: str) -> bool:
     return any(token in text for token in _CERT_FAIL)
 
 
-def _run_logged(cmd: list[str]) -> tuple[int, str]:
+def _run_logged(cmd: list[str], on_started=None) -> tuple[int, str]:
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -202,11 +203,22 @@ def _run_logged(cmd: list[str]) -> tuple[int, str]:
         **process_manager.creation_options(),
     )
     chunks: list[str] = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        logger.info("%s", line.rstrip())
-        chunks.append(line)
-    return process.wait(), "".join(chunks)
+    try:
+        if on_started:
+            on_started(process.pid)
+        assert process.stdout is not None
+        for line in process.stdout:
+            logger.info("%s", line.rstrip())
+            chunks.append(line)
+        return process.wait(), "".join(chunks)
+    finally:
+        # Do not release the UID lock while a failed log reader leaves biliup alive.
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        if process.stdout:
+            process.stdout.close()
+
 
 
 def _require_cookies(settings: Settings) -> None:

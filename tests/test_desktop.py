@@ -12,7 +12,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from yt2bili import events, media, pipeline, youtube
+from yt2bili import events, media, pipeline, youtube, bili_upload, desktop_auth
 from yt2bili.db import Task, TaskStore
 from yt2bili.desktop_auth import LoginSession, validate_login
 from yt2bili.desktop_service import DesktopService, parse_urls
@@ -31,7 +31,7 @@ class MemoryVault:
 
 
 def login_fixture():
-    return {"cookie_info": {"cookies": [{"name": name, "value": "fixture"} for name in ("SESSDATA", "bili_jct", "DedeUserID")]},
+    return {"cookie_info": {"cookies": [{"name": name, "value": "123" if name == "DedeUserID" else "fixture"} for name in ("SESSDATA", "bili_jct", "DedeUserID")]},
             "sso": [], "token_info": {"access_token": "fixture", "refresh_token": "fixture", "expires_in": 3600, "mid": 123}}
 
 
@@ -39,7 +39,7 @@ class DesktopTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.environment = patch.dict(os.environ, {})
+        self.environment = patch.dict(os.environ, {"YT2BILI_COORDINATION_DIR": str(Path(self.tmp.name) / "coordination")})
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.paths = AppPaths.default(self.tmp.name, self.tmp.name)
@@ -48,6 +48,8 @@ class DesktopTests(unittest.TestCase):
         self.addCleanup(self.service.close)
         self.service.config.set_key("test-key")
         self.uploads = []
+        self.account = self.service.accounts.bind(login_fixture(), verify=False)
+        self.service.config.values["upload_gap_seconds"] = 0
 
     def wait_idle(self):
         deadline = time.monotonic() + 5
@@ -72,7 +74,8 @@ class DesktopTests(unittest.TestCase):
         task.cover_path = str(cover)
         store.upsert(task)
 
-    def upload(self, settings, log, video, cover, title, desc, url):
+    def upload(self, settings, video, cover, title, desc, url, on_started=None):
+        if on_started: on_started(99999999)
         self.uploads.append((video.parent.name, title, desc))
         return "BV1234567890"
 
@@ -84,11 +87,13 @@ class DesktopTests(unittest.TestCase):
         stack.enter_context(patch.object(youtube, "download_video", side_effect=self.download))
         stack.enter_context(patch.object(media, "prepare_upload_video", side_effect=lambda source, *a, **kw: source))
         stack.enter_context(patch.object(pipeline, "_prepare_assets", side_effect=self.prepare))
-        stack.enter_context(patch.object(pipeline, "_upload_serialized", side_effect=self.upload))
+        stack.enter_context(patch.object(bili_upload, "upload", side_effect=self.upload))
+        stack.enter_context(patch.object(bili_upload, "renew"))
+        stack.enter_context(patch.object(desktop_auth, "verify_credentials", side_effect=lambda info: {"uid": desktop_auth.credential_identity(info), "nickname": "Test"}))
         return stack
 
     def create(self, video_id="abcdefghijk", **kwargs):
-        return self.service.create("https://youtu.be/" + video_id, "create-" + video_id, **kwargs)
+        return self.service.create("https://youtu.be/" + video_id, "create-" + video_id, account_id=self.account["account_id"], **kwargs)
 
     def test_preview_never_submits_and_edit_is_used_on_submit(self):
         with self.mocks():
@@ -115,14 +120,19 @@ class DesktopTests(unittest.TestCase):
             self.wait_idle()
             self.assertEqual(first, second)
             self.assertEqual(len(self.service.store.list_all()), 1)
-            result = self.service.create("https://youtube.com/watch?v=abcdefghijk&t=20", "another-operation")
-            self.assertEqual(result["skipped"], ["abcdefghijk"])
+            result = self.service.create("https://youtube.com/watch?v=abcdefghijk&t=20", "another-operation", account_id=self.account["account_id"])
+            self.assertFalse(result["created"])
 
-    def test_external_work_lock_prevents_gui_enqueue(self):
-        with work_lock(self.service.config.build().work_dir / "abcdefghijk"):
-            with self.assertRaises(Yt2BiliError): self.create()
-        self.assertFalse(self.service.scheduler.snapshot()["active"])
-        self.assertIsNone(self.service.store.get("abcdefghijk"))
+    def test_external_work_lock_prevents_retry(self):
+        with self.mocks():
+            self.create()
+            self.wait_idle()
+            task = self.service.task("abcdefghijk")
+            self.service.store.update(task.task_id, status="failed")
+            with work_lock(Path(task.work_dir)):
+                self.service.retry(task.task_id, "locked-retry")
+                self.wait_idle()
+            self.assertEqual(self.service.task(task.task_id).status, "failed")
 
     def test_export_includes_rotated_logs_and_redacts_credentials(self):
         (self.paths.root / "logs/desktop.log.1").write_text("old task complete\nSESSDATA=secret", encoding="utf-8")
@@ -139,7 +149,7 @@ class DesktopTests(unittest.TestCase):
             self.create()
             self.wait_idle()
             self.service.config.build().bili_cookies.write_text("{}")
-            with patch.object(pipeline, "_upload_serialized", return_value=""):
+            with patch.object(bili_upload, "upload", side_effect=lambda *a, **k: (k["on_started"](99999999), "")[1]):
                 self.service.submit("abcdefghijk", "submit-unknown")
                 self.wait_idle()
             task = self.service.task("abcdefghijk")
@@ -151,11 +161,14 @@ class DesktopTests(unittest.TestCase):
             self.assertTrue(Path(task.video_path).exists())
 
     def test_upload_error_becomes_unknown_not_automatic_retry(self):
+        def fail_upload(*args, **kwargs):
+            kwargs["on_started"](99999999)
+            raise Yt2BiliError("connection lost")
         with self.mocks():
             self.create()
             self.wait_idle()
             self.service.config.build().bili_cookies.write_text("{}")
-            with patch.object(pipeline, "_upload_serialized", side_effect=Yt2BiliError("connection lost")):
+            with patch.object(bili_upload, "upload", side_effect=fail_upload):
                 self.service.submit("abcdefghijk", "submit-lost")
                 self.wait_idle()
             self.assertEqual(self.service.task("abcdefghijk").status, "submission_unknown")
@@ -169,12 +182,12 @@ class DesktopTests(unittest.TestCase):
             if "44444444444" in url: fourth.set()
             return original(url, *args, **kwargs)
         def validate(source, *args, **kwargs):
-            if source.parent.name == "11111111111":
+            if not validating.is_set():
                 validating.set(); release.wait(4)
             return source
         with self.mocks(), patch.object(youtube, "download_video", side_effect=download), patch.object(media, "prepare_upload_video", side_effect=validate):
             try:
-                self.service.create("\n".join("https://youtu.be/" + str(i) * 11 for i in range(1, 5)), "batch-operation")
+                for i in range(1, 5): self.create(str(i) * 11)
                 self.assertTrue(validating.wait(2))
                 self.assertTrue(fourth.wait(2))
             finally:
@@ -210,6 +223,8 @@ class DesktopTests(unittest.TestCase):
 
     def test_repair_preserves_bv_without_posting(self):
         task = Task("abcdefghijk", "https://youtu.be/abcdefghijk", "submitted", bv_id="BV1234567890")
+        task.account_id = self.account["account_id"]
+        task.account_uid_snapshot = self.account["uid"]
         self.service.store.upsert(task)
         with self.mocks():
             self.service.repair(task.video_id, "repair-operation")
@@ -248,7 +263,7 @@ class DesktopTests(unittest.TestCase):
 
 class ContractTests(unittest.TestCase):
     def test_parse_urls_validates_host_and_deduplicates_video_id(self):
-        items = parse_urls("# comment\nhttps://youtu.be/-abcdefghij\nhttps://www.youtube.com/watch?v=-abcdefghij&t=10")
+        items = parse_urls("https://www.youtube.com/watch?v=-abcdefghij&t=10")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0][0], "-abcdefghij")
         for invalid in ("file:///tmp/abcdefghijk", "https://youtube.com.evil.test/watch?v=abcdefghijk", "https://youtube.com/playlist?list=123"):
@@ -262,8 +277,8 @@ class ContractTests(unittest.TestCase):
         stream = io.StringIO()
         protocol = Protocol(stream)
         for method in ("ok", "fail"):
-            protocol.handle(Service(), {"protocol_version": 1, "request_id": method, "method": method})
-        protocol.handle(Service(), {"protocol_version": 2, "request_id": "old"})
+            protocol.handle(Service(), {"protocol_version": 2, "request_id": method, "method": method})
+        protocol.handle(Service(), {"protocol_version": 1, "request_id": "old"})
         lines = [json.loads(line) for line in stream.getvalue().splitlines()]
         self.assertTrue(lines[0]["result"]["ok"])
         self.assertEqual(lines[1]["error"]["message"], "safe message")

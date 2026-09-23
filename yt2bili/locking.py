@@ -6,10 +6,49 @@ import json
 import hashlib
 import tempfile
 import time
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
 from yt2bili.exceptions import Yt2BiliError
+
+_uid_mutex_guard = threading.Lock()
+_uid_mutexes = {}
+
+
+class AccountBusy(Yt2BiliError):
+    pass
+
+
+def coordination_dir(uid):
+    from yt2bili.identity import normalize_uid
+    from yt2bili.paths import AppPaths
+    override = os.environ.get("YT2BILI_COORDINATION_DIR")
+    root = Path(override) if override else AppPaths.default().root / "coordination/bilibili"
+    return root / normalize_uid(uid)
+
+
+@contextmanager
+def account_guard(uid):
+    """Nonblocking, UID-scoped credential/upload lock shared across profiles."""
+    from yt2bili.identity import normalize_uid
+    uid = normalize_uid(uid)
+    with _uid_mutex_guard:
+        mutex = _uid_mutexes.setdefault(uid, threading.Lock())
+    if not mutex.acquire(blocking=False):
+        raise AccountBusy("账号正在被另一操作使用，请稍后重试。")
+    lock = FileLock(coordination_dir(uid) / "upload.lock")
+    try:
+        try:
+            lock.__enter__()
+        except Yt2BiliError as exc:
+            raise AccountBusy("账号正在被另一进程使用，请稍后重试。") from exc
+        try:
+            yield
+        finally:
+            lock.__exit__(None, None, None)
+    finally:
+        mutex.release()
 
 
 def work_lock(work_dir: Path):
@@ -54,31 +93,3 @@ class FileLock:
                 fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
             self.file.close()
             self.file = None
-
-
-@contextmanager
-def upload_guard(settings):
-    """Conservatively serialize all uploads for this OS user, even copied cookies."""
-    from yt2bili import events
-    # Preserve library callers which provide minimal test settings without credentials.
-    if not hasattr(settings, "bili_cookies"):
-        yield
-        return
-    folder = Path(tempfile.gettempdir()) / "stardazz-yt2bili-upload"
-    with FileLock(folder / "account.lock"):
-        marker = folder / "last-upload.json"
-        try:
-            ended = float(json.loads(marker.read_text())["ended"])
-        except (OSError, ValueError, KeyError):
-            ended = 0
-        deadline = time.monotonic() + min(settings.upload_gap_seconds, max(0, ended + settings.upload_gap_seconds - time.time()))
-        remaining = max(0, deadline - time.monotonic())
-        while remaining > 0:
-            events.progress("upload_wait", force=True, remaining=round(remaining, 1), percent=None)
-            time.sleep(min(0.25, remaining))
-            remaining = max(0, deadline - time.monotonic())
-        try:
-            yield
-        finally:
-            from yt2bili.desktop_settings import atomic_json
-            atomic_json(marker, {"ended": time.time()})

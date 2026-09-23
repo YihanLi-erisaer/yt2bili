@@ -209,17 +209,11 @@ class StageQueueTests(unittest.TestCase):
         self.assertFalse(self.downloads)
         self.assertTrue((self.settings.work_dir / "A").exists())
 
-    def test_upload_gap_is_twenty_seconds_after_previous_completion(self):
+    def test_old_upload_entry_cannot_bypass_account_coordinator(self):
         self.assertEqual(Settings.__dataclass_fields__["upload_gap_seconds"].default, 20)
-        with patch.object(pipeline, "_last_upload_monotonic", 100), \
-             patch.object(pipeline.time, "monotonic", side_effect=[105, 130]), \
-             patch.object(pipeline.time, "sleep") as sleep, \
-             patch.object(bili_upload, "renew"), \
-             patch.object(bili_upload, "upload", return_value="BVtest"):
-            result = pipeline._upload_serialized(self.settings, logging.getLogger(), Path("video"), Path("cover"), "title", "desc", "url")
-            self.assertEqual(result, "BVtest")
-            sleep.assert_called_once_with(15)
-            self.assertEqual(pipeline._last_upload_monotonic, 130)
+        with patch.object(bili_upload, "upload") as upload, self.assertRaises(Yt2BiliError):
+            pipeline._upload_serialized(self.settings, logging.getLogger(), Path("video"), Path("cover"), "title", "desc", "url")
+        upload.assert_not_called()
 
 
 if __name__ == "__main__":
