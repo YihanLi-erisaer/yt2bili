@@ -64,7 +64,7 @@ class Scheduler:
             work = settings.work_dir / task.video_id
             lock = work_lock(work)
             lock.__enter__()
-            original = task.status if repair else ""
+            original = task.status if repair or mode == "retranslate" else ""
             job = pipeline._PipelineJob(task.url)
             item = ScheduledJob(task.video_id, job, settings, "repair" if repair else mode, original, stage, lock=lock)
             try:
@@ -129,7 +129,14 @@ class Scheduler:
                             self.queues["upload"].put(item)
                     else:
                         # Explicit submission revalidates the edited ready task without retranslation.
-                        if item.mode == "submit":
+                        if item.mode == "retranslate":
+                            from yt2bili.translation.tasks import prepare
+                            item.job.task.status = "translating"
+                            self.store.upsert(item.job.task)
+                            prepare(item.settings, self.store, item.job.task, item.job.meta, item.job.work_dir, force=True)
+                            item.job.task.status = "ready"
+                            self.store.upsert(item.job.task)
+                        elif item.mode == "submit":
                             with pipeline._job_context(item.job):
                                 events.check_cancelled()
                                 pipeline._submit_ready(item.settings, self.store, item.job.task, item.job.meta, item.job.work_dir, dry_run=False)
@@ -148,7 +155,7 @@ class Scheduler:
                         continue
                     except Exception as recovery:
                         exc = recovery
-                current.status = (item.original_status if item.mode == "repair" else
+                current.status = (item.original_status if item.mode in ("repair", "retranslate") else
                                   "submission_unknown" if current.status in ("uploading", "submission_unknown") else
                                   "cancelled" if item.cancel.is_set() else "failed")
                 current.error = str(exc)

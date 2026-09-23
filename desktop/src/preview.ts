@@ -10,10 +10,18 @@ const config = {
   hwaccel: "auto",
   validation_cache: true,
   has_deepl_key: false,
+  translation_primary: "local_llm",
+  translation_fallback_enabled: true,
+  translation_ready: false,
+  local_llm_mode: "managed",
+  local_llm_base_url: "http://127.0.0.1:11435",
+  local_llm_model: "qwen3:8b",
   data_dir: "本地应用数据目录",
   youtube_cookies: false,
   vault_error: "",
 };
+let translationJobs: any[] = [];
+let localInstalled = false;
 let tasks: Task[] = [];
 if (new URLSearchParams(location.search).has("populated"))
   tasks = [
@@ -53,6 +61,50 @@ if (new URLSearchParams(location.search).has("populated"))
   }));
 export async function request(method: string, params: any): Promise<any> {
   if (method === "system.health") return { protocol_version: 1 };
+  if (method === "translation.status")
+    return {
+      local: {
+        state: localInstalled ? "ready" : "missing",
+        message: localInstalled
+          ? "开发预览 · 本地组件已就绪"
+          : "开发预览 · 尚未安装本地组件",
+      },
+    };
+  if (method === "translation.jobs.get")
+    return params.job_id
+      ? translationJobs.find((j) => j.job_id === params.job_id)
+      : { items: translationJobs };
+  if (method === "translation.install" || method === "translation.test") {
+    const job = {
+      job_id: crypto.randomUUID(),
+      kind: method.endsWith("test") ? "test:" + params.provider : "install",
+      state: "running",
+      result: {
+        title: "更好的工作流",
+        description: "构建实用工具。保留版本 2.0。",
+        elapsed_ms: 800,
+      },
+    };
+    translationJobs.push(job);
+    setTimeout(() => {
+      if (job.state === "running") {
+        job.state = "complete";
+        if (job.kind === "install") localInstalled = true;
+        config.translation_ready = true;
+      }
+    }, 1000);
+    return { job_id: job.job_id };
+  }
+  if (method === "translation.jobs.cancel") {
+    translationJobs.find((j) => j.job_id === params.job_id).state = "cancelled";
+    return { requested: true };
+  }
+  if (method === "tasks.retranslate") {
+    const task = tasks.find((t) => t.video_id === params.video_id)!;
+    task.title_zh = "重新翻译的标题";
+    return { queued: true };
+  }
+
   if (method === "settings.get") return { ...config };
   if (method === "settings.update") {
     Object.assign(config, params.values);

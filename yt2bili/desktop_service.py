@@ -70,6 +70,8 @@ class DesktopService:
         self.login = None
         self.auth_state = {"status": "idle"}
         self.config = DesktopSettings(paths, vault)
+        from yt2bili.translation.jobs import TranslationJobs
+        self.translation_jobs = TranslationJobs(paths.root / "translation", self.emit)
         self.store = TaskStore(paths.root / "data/tasks.sqlite", self.emit)
         self.scheduler = Scheduler(self.store, self.config, self.emit)
         os.environ["YT2BILI_BIN_DIR"] = str(paths.resources / "bin")
@@ -94,7 +96,7 @@ class DesktopService:
         self.output("task.log", entry)
 
     def ensure_idle(self):
-        if self.scheduler.snapshot()["active"]:
+        if self.scheduler.snapshot()["active"] or self.translation_jobs.active():
             raise Yt2BiliError("请等待当前任务结束后修改设置或账号。")
 
     def task(self, video_id):
@@ -116,6 +118,10 @@ class DesktopService:
         handlers = {
             "system.health": self.health, "system.diagnostics": self.diagnostics,
             "settings.get": lambda: self.config.public(), "settings.update": self.update_settings,
+            "translation.status": self.translation_status, "translation.test": self.translation_test,
+            "translation.install": self.translation_install, "translation.jobs.get": self.translation_jobs.get,
+            "translation.jobs.cancel": self.translation_jobs.cancel,
+            "tasks.retranslate": self.retranslate,
             "credentials.set": self.set_key, "credentials.test": self.test_key,
             "tasks.create": self.create, "tasks.list": self.list_tasks, "tasks.get": self.get_task,
             "tasks.retry": self.retry, "tasks.cancel": self.cancel, "tasks.submit": self.submit,
@@ -136,7 +142,53 @@ class DesktopService:
 
     def health(self):
         return {"protocol_version": 1, "version": "0.2.0-alpha.1", "queue": self.scheduler.snapshot(),
-                "data_dir": str(self.paths.root)}
+                "data_dir": str(self.paths.root), "capabilities": ["local_translation_v1"]}
+
+    def translation_status(self):
+        from yt2bili.translation.runtime import status, manifest
+        return {"local": status(self.config.values, self.paths.root / "translation"),
+                "primary": self.config.values["translation_primary"],
+                "fallback_enabled": self.config.values["translation_fallback_enabled"],
+                "model": manifest()["model"], "runtime": manifest()["runtime"]}
+
+    def translation_install(self, operation_id, model_id="qwen3:8b", offline_path=None):
+        if model_id != "qwen3:8b":
+            raise Yt2BiliError("不支持的模型。")
+        from yt2bili.translation.deployment import install
+        with self.mutation:
+            if self.scheduler.snapshot()["active"]:
+                raise Yt2BiliError("请等待视频任务结束后安装组件。")
+            config = dict(self.config.values)
+            return self.translation_jobs.start("install", operation_id,
+                lambda: install(config, self.paths.root / "translation", offline_path=offline_path))
+
+    def translation_test(self, provider, operation_id):
+        if provider not in ("local_llm", "deepl"):
+            raise Yt2BiliError("不支持的翻译服务。")
+        from dataclasses import replace
+        from yt2bili.translation.service import translate as translate_group
+        with self.mutation:
+            if self.scheduler.snapshot()["active"]:
+                raise Yt2BiliError("请等待视频任务结束后试译。")
+            settings = replace(self.config.build(), translation_primary=provider, translation_fallback_enabled=False)
+            return self.translation_jobs.start("test:" + provider, operation_id,
+                lambda: asdict(translate_group(settings, "A better workflow", "Build useful tools. Keep version 2.0.", "en", 80, 1000)))
+
+    def retranslate(self, video_id, operation_id, replace_edited=False):
+        def action():
+            self.ensure_inactive(video_id)
+            task = self.task(video_id)
+            if task.status != "ready":
+                raise Yt2BiliError("只能重新翻译尚未投稿且已准备好的任务。")
+            record = self.store.translation(video_id) or {}
+            if record.get("user_edited") and replace_edited is not True:
+                raise Yt2BiliError("重新翻译将替换已编辑内容，请确认后继续。")
+            saved = (self.store.get_job(video_id) or {}).get("settings", self.config.snapshot())
+            from yt2bili.translation.config import DEFAULTS
+            saved = {**saved, **{k: self.config.values[k] for k in DEFAULTS}}
+            self.scheduler.add(task, "retranslate", saved, stage="upload")
+            return {"queued": True}
+        return self.operation(operation_id, "tasks.retranslate", action)
 
     def diagnostics(self):
         tools = []
@@ -199,8 +251,8 @@ class DesktopService:
         urls = parse_urls(text)
         def action():
             self.ensure_login_finished()
-            if not self.config.key():
-                raise Yt2BiliError("请先在账号与连接中配置 DeepL 密钥。")
+            if self.translation_jobs.active():
+                raise Yt2BiliError("请等待翻译组件操作结束后创建任务。")
             if mode == "auto" and not self.config.build().bili_cookies.is_file():
                 raise Yt2BiliError("自动投稿前请先登录 B 站。")
             added, skipped = [], []
@@ -231,17 +283,25 @@ class DesktopService:
         task = self.task(video_id)
         result = asdict(task)
         result["snapshot"] = self.store.get_job(video_id)
+        result["translation"] = self.store.translation(video_id)
         result["file_exists"] = bool(task.video_path and Path(task.video_path).is_file())
         return result
 
-    def retry(self, video_id, operation_id):
+    def retry(self, video_id, operation_id, use_current_translation_settings=False):
         def action():
             self.ensure_login_finished()
             task = self.task(video_id)
             if task.status not in ("failed", "cancelled", "interrupted"):
                 raise Yt2BiliError("只有失败、取消或中断的任务可以继续；待核对投稿需先核对结果。")
             snapshot = self.store.get_job(video_id) or {}
-            self.scheduler.add(task, "preview", snapshot.get("settings"))
+            settings = snapshot.get("settings")
+            if use_current_translation_settings is True:
+                from yt2bili.translation.config import DEFAULTS
+                settings = {**(settings or self.config.snapshot()), **{k: self.config.values[k] for k in DEFAULTS}}
+                record = self.store.translation(video_id) or {}
+                record["config_snapshot"] = {k: self.config.values[k] for k in DEFAULTS}
+                self.store.save_translation(task, record)
+            self.scheduler.add(task, "preview", settings)
             return {"queued": True}
         return self.operation(operation_id, "tasks.retry", action)
 
@@ -287,7 +347,9 @@ class DesktopService:
             task.title_zh = title.strip().replace("\n", " ")
             body = description.split("\n\n————————\n原标题：")[0]
             task.desc_zh = translate.build_description(body, task.title_orig, task.uploader, task.url, 2000)
-            self.store.upsert(task)
+            record = self.store.translation(video_id) or {}
+            record.update(state="edited", user_edited=True, description=body)
+            self.store.save_translation(task, record)
             for name, content in (("title.txt", task.title_zh), ("desc.txt", task.desc_zh)):
                 (Path(task.work_dir) / name).write_text(content, encoding="utf-8")
             return asdict(task)
@@ -441,6 +503,11 @@ class DesktopService:
                 elif task.status not in ("submitted", "ready", "failed", "cancelled", "submission_unknown"):
                     task.status = "interrupted"
                 self.store.upsert(task)
+                from yt2bili.translation.config import legacy_snapshot
+                legacy_record = {"config_snapshot": legacy_snapshot({})}
+                if task.title_zh:
+                    legacy_record.update(state="legacy_preserved", provider="unknown", user_edited=False)
+                self.store.save_translation(task, legacy_record)
                 imported += 1
             return {"imported": imported, "note": "只导入任务记录，素材保留原位，账号和密钥需单独配置。"}
 
@@ -468,5 +535,6 @@ class DesktopService:
 
     def close(self):
         self.login_cancel()
+        self.translation_jobs.close()
         self.scheduler.close()
         self.store.close()

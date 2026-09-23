@@ -42,6 +42,25 @@ def main(argv: list[str] | None = None) -> int:
 
 def _dispatch(args: argparse.Namespace, settings, store: TaskStore) -> int:
     command = args.command
+    if command == "translation":
+        import json
+        from dataclasses import asdict, replace
+        from yt2bili.translation.config import snapshot, component_root
+        from yt2bili.translation.runtime import status
+        from yt2bili.translation.deployment import install, export_bundle
+        from yt2bili.translation.service import translate as translate_group
+        root, config = component_root(settings), snapshot(settings)
+        if args.translation_command == "setup":
+            result = install(config, root, offline_path=args.offline)
+        elif args.translation_command == "export":
+            result = export_bundle(root, args.path)
+        elif args.translation_command == "test":
+            selected = replace(settings, translation_primary=args.provider, translation_fallback_enabled=False)
+            result = asdict(translate_group(selected, "A better workflow", "Build useful tools. Keep version 2.0.", "en", 80, 1000))
+        else:
+            result = {"primary": config["translation_primary"], "fallback_enabled": config["translation_fallback_enabled"], "local": status(config, root)}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if command == "setup":
         require_ffmpeg()
         path = bili_upload.setup_biliup(settings)
@@ -54,7 +73,7 @@ def _dispatch(args: argparse.Namespace, settings, store: TaskStore) -> int:
                 "未找到 Deno 或 Node.js，YouTube 解析可能被拦截。"
                 "请安装 https://nodejs.org 或把 deno.exe 放到 bin\\"
             )
-        logger.info("下一步：把 .env.example 复制为 .env，填入 DEEPL_AUTH_KEY，然后运行 python -m yt2bili login")
+        logger.info("下一步：运行 python -m yt2bili translation setup 安装本地翻译组件，或在 .env 配置 DeepL；然后运行 python -m yt2bili login")
         return 0
     if command == "login":
         bili_upload.login(settings)
@@ -109,6 +128,14 @@ def _dispatch(args: argparse.Namespace, settings, store: TaskStore) -> int:
             return 1
         return 0
     if command == "retry":
+        if args.use_current_translation_settings:
+            from yt2bili.translation.config import snapshot
+            task = store.require(args.video_id)
+            if task.status not in ("failed", "cancelled", "interrupted"):
+                raise Yt2BiliError("仅失败、取消或中断任务可更新翻译设置后重试。")
+            record = store.translation(task.video_id) or {}
+            record["config_snapshot"] = snapshot(settings)
+            store.save_translation(task, record)
         task = pipeline.retry(
             settings,
             store,
@@ -146,6 +173,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("login", help="B 站扫码登录，Cookie 写入 secrets/")
     sub.add_parser("renew", help="刷新 B 站登录态")
     sub.add_parser("list", help="列出本地任务")
+    translation = sub.add_parser("translation", help="安装、检测和试译本地翻译组件")
+    translation_sub = translation.add_subparsers(dest="translation_command", required=True)
+    setup_translation = translation_sub.add_parser("setup", help="下载约 7 GB 组件，安装前检查磁盘空间")
+    setup_translation.add_argument("--offline", help="导入本产品导出的离线组件 ZIP")
+    translation_sub.add_parser("status", help="检查翻译配置及本地组件")
+    test_translation = translation_sub.add_parser("test", help="用固定短句试译；DeepL 会消耗少量额度")
+    test_translation.add_argument("--provider", choices=("local_llm", "deepl"), default="local_llm")
+    export_translation = translation_sub.add_parser("export", help="导出已校验的离线组件包")
+    export_translation.add_argument("path", help="保存 ZIP 的路径")
 
     yt_ck = sub.add_parser(
         "youtube-cookies",
@@ -190,6 +226,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="YouTube 视频 ID（以 - 开头时也可直接写，如 retry -GiIT0fNvW8）",
     )
     retry_p.add_argument("--dry-run", action="store_true", help="续跑但不上传")
+    retry_p.add_argument("--use-current-translation-settings", action="store_true", help="使用当前翻译策略重试，保留已编辑译文")
     repair_p = sub.add_parser("repair", help="修复本地投稿文件，不重复投稿；可用于已提交但平台转码失败的任务")
     repair_p.add_argument("video_ids", nargs="+", help="一个或多个已有任务的 YouTube 视频 ID")
     repair_p.add_argument("--redownload", action="store_true", help="保留旧文件到 rejected/，重新下载完整源文件")
@@ -206,7 +243,7 @@ def _protect_retry_video_id(argv: list[str]) -> list[str]:
     rest = argv[idx + 1 :]
     if "--" in rest:
         return argv
-    flags = {"-h", "--help", "--dry-run"}
+    flags = {"-h", "--help", "--dry-run", "--use-current-translation-settings"}
     video_id: str | None = None
     options: list[str] = []
     extras: list[str] = []

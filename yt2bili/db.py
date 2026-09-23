@@ -58,11 +58,11 @@ class TaskStore:
         self._conn.row_factory = sqlite3.Row
         self.on_change = on_change
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version > 1:
+        if version > 2:
             self._conn.close()
             raise Yt2BiliError("数据库版本高于当前程序，请使用更新版本。")
-        if version == 0 and db_path.stat().st_size:
-            with closing(sqlite3.connect(str(db_path) + ".pre-desktop.bak")) as backup:
+        if version < 2 and db_path.stat().st_size:
+            with closing(sqlite3.connect(str(db_path) + (".pre-desktop.bak" if version == 0 else ".pre-translation.bak"))) as backup:
                 self._conn.backup(backup)
         self._conn.execute(
             """
@@ -89,7 +89,20 @@ class TaskStore:
         with self._conn:
             self._conn.execute("CREATE TABLE IF NOT EXISTS desktop_jobs (video_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             self._conn.execute("CREATE TABLE IF NOT EXISTS desktop_operations (id TEXT PRIMARY KEY, method TEXT NOT NULL, result TEXT NOT NULL)")
-            self._conn.execute("PRAGMA user_version=1")
+            self._conn.execute("CREATE TABLE IF NOT EXISTS task_translation (video_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            self._conn.execute("CREATE TABLE IF NOT EXISTS translation_attempts (id INTEGER PRIMARY KEY, video_id TEXT NOT NULL, payload TEXT NOT NULL)")
+            if version < 2:
+                from yt2bili.translation.config import legacy_snapshot
+                for row in self._conn.execute("SELECT video_id,payload FROM desktop_jobs").fetchall():
+                    job = json.loads(row["payload"])
+                    job["settings"] = legacy_snapshot(job.get("settings", {}))
+                    self._conn.execute("UPDATE desktop_jobs SET payload=? WHERE video_id=?", (json.dumps(job), row["video_id"]))
+                for row in self._conn.execute("SELECT video_id,title_zh,desc_zh FROM tasks").fetchall():
+                    record = {"config_snapshot": legacy_snapshot({})}
+                    if row["title_zh"]:
+                        record.update(state="legacy_preserved", provider="unknown", user_edited=False)
+                    self._conn.execute("INSERT OR IGNORE INTO task_translation VALUES (?,?)", (row["video_id"], json.dumps(record)))
+            self._conn.execute("PRAGMA user_version=2")
 
     def get(self, video_id: str) -> Task | None:
         with self._lock:
@@ -105,7 +118,7 @@ class TaskStore:
             ).fetchall()
             return [self._row_to_task(r) for r in rows]
 
-    def upsert(self, task: Task) -> None:
+    def upsert(self, task: Task, *, commit=True) -> None:
         with self._lock:
             now = _now()
             existing = self.get(task.video_id)
@@ -154,9 +167,32 @@ class TaskStore:
                     task.updated_at,
                 ),
             )
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
+        if commit and self.on_change:
+            self.on_change("task.status", asdict(task))
+
+    def translation(self, video_id):
+        with self._lock:
+            row = self._conn.execute("SELECT payload FROM task_translation WHERE video_id=?", (video_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def reset_translation(self, video_id):
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM task_translation WHERE video_id=?", (video_id,))
+
+    def save_translation(self, task, record):
+        # The task pair and provenance commit together. upsert must not commit here.
+        with self._lock, self._conn:
+            self.upsert(task, commit=False)
+            self._conn.execute("INSERT OR REPLACE INTO task_translation VALUES (?,?)", (task.video_id, json.dumps(record, ensure_ascii=False)))
         if self.on_change:
             self.on_change("task.status", asdict(task))
+
+    def translation_attempt(self, video_id, attempts):
+        with self._lock, self._conn:
+            self._conn.execute("INSERT INTO translation_attempts(video_id,payload) VALUES (?,?)", (video_id, json.dumps({"time": _now(), "attempts": attempts})))
+            self._conn.execute("DELETE FROM translation_attempts WHERE video_id=? AND id NOT IN (SELECT id FROM translation_attempts WHERE video_id=? ORDER BY id DESC LIMIT 20)", (video_id, video_id))
 
     def save_job(self, video_id: str, payload: dict) -> None:
         with self._lock, self._conn:

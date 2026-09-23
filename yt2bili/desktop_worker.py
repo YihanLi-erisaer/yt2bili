@@ -83,6 +83,9 @@ class Protocol:
 
 
 def main():
+    if "--translation-request" in sys.argv:
+        from yt2bili.translation.worker import main as translate_request
+        return translate_request()
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir")
     parser.add_argument("--resources")

@@ -227,6 +227,49 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaises(Yt2BiliError): self.service.update_settings({"upload_gap_seconds": -1})
         with self.assertRaises(Yt2BiliError): self.service.update_settings({"deepl_auth_key": "bad"})
 
+    def test_local_task_creation_does_not_require_deepl_vault(self):
+        self.service.config.set_key("")
+        with self.mocks(), patch.object(self.service.config, "key", side_effect=AssertionError("must not read key")):
+            self.create()
+            self.wait_idle()
+        self.assertEqual(self.service.task("abcdefghijk").status, "ready")
+
+    def test_retranslation_requires_confirmation_preserves_on_error_and_never_uploads(self):
+        from yt2bili.translation.types import TranslationError, TranslationResult
+        with self.mocks():
+            self.create(); self.wait_idle()
+        self.service.update_metadata("abcdefghijk", "用户编辑", "用户正文")
+        with self.assertRaises(Yt2BiliError):
+            self.service.retranslate("abcdefghijk", "retranslate-no-confirm")
+        with patch("yt2bili.translation.tasks.translate_group", side_effect=TranslationError("FAIL", "模拟翻译失败")):
+            self.service.retranslate("abcdefghijk", "retranslate-fail", replace_edited=True)
+            self.wait_idle()
+        self.assertEqual(self.service.task("abcdefghijk").title_zh, "用户编辑")
+        self.assertEqual(self.service.task("abcdefghijk").status, "ready")
+        with patch("yt2bili.translation.tasks.translate_group", return_value=TranslationResult("新翻译", "新正文", "local_llm")):
+            self.service.retranslate("abcdefghijk", "retranslate-success", replace_edited=True)
+            self.wait_idle()
+        self.assertEqual(self.service.task("abcdefghijk").title_zh, "新翻译")
+        self.assertEqual(self.service.task("abcdefghijk").status, "ready")
+        self.assertFalse(self.uploads)
+
+    def test_translation_job_returns_immediately_and_is_idempotent(self):
+        from yt2bili.translation.types import TranslationResult
+        started, release=threading.Event(), threading.Event()
+        def slow(*args, **kwargs):
+            started.set(); release.wait(3)
+            return TranslationResult("试译", "正文", "local_llm")
+        with patch("yt2bili.translation.service.translate", side_effect=slow):
+            first=self.service.translation_test("local_llm", "same-operation")
+            self.assertTrue(started.wait(1))
+            second=self.service.translation_test("local_llm", "same-operation")
+            self.assertEqual(first,second)
+            self.service.translation_jobs.cancel(first["job_id"])
+            release.set()
+            until=time.monotonic()+3
+            while self.service.translation_jobs.active() and time.monotonic()<until:time.sleep(.01)
+            self.assertEqual(self.service.translation_jobs.get(first["job_id"])["state"],"cancelled")
+
     def test_configuration_and_edit_are_blocked_for_active_task(self):
         started, release = threading.Event(), threading.Event()
         def download(*args, **kwargs):

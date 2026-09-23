@@ -1,6 +1,6 @@
 # yt2bili
 
-把**你有权转载**的 YouTube 视频下载下来，用 DeepL 把标题和简介译成中文，再投稿到 B 站。
+把**你有权转载**的 YouTube 视频下载下来，默认用本地开源大模型把标题和简介译成中文（也可优先使用 DeepL），再投稿到 B 站。
 
 支持一次传入多条链接：下载和封面处理可以并行，B 站上传会自动排队（同一账号不并行投稿）。创作声明为「内容无需标注」，简介末尾会带上原标题、原作者和原链接。
 
@@ -21,7 +21,7 @@
 - Windows 10/11（也可用手动安装的 biliup 在其它系统上跑）
 - Python 3.11+
 - [FFmpeg](https://ffmpeg.org/download.html)（`ffmpeg` 和 `ffprobe` 都要在 PATH 里）
-- [DeepL API Free](https://www.deepl.com/pro-api) 密钥（以 `:fx` 结尾）
+- 本地翻译组件，或可选的 [DeepL API](https://www.deepl.com/pro-api) 密钥
 - 可以正常网页投稿的 B 站账号
 
 ## 安装
@@ -35,7 +35,9 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-用编辑器打开 `.env`，填入 `DEEPL_AUTH_KEY`。密钥不要发给任何人，也不要提交到 Git。
+默认本地优先，执行 `python -m yt2bili translation setup` 安装固定版本的 Ollama 和 Qwen3 8B，再用 `python -m yt2bili translation test` 试译。首次下载约 6.7 GB；安装会检查空间。
+
+如需 DeepL，在 `.env` 填入可选的 `DEEPL_AUTH_KEY`，设置 `TRANSLATION_PRIMARY=deepl` 可优先使用它。`TRANSLATION_FALLBACK_ENABLED=false` 关闭自动切换。密钥不要提交到 Git。详细部署、离线导入与验收边界见[本地翻译实现说明](docs/本地翻译实现与验证.md)。
 
 下载投稿工具并检查 FFmpeg：
 
@@ -122,7 +124,7 @@ python -m yt2bili youtube-cookies
 1. 解析链接元数据  
 2. 下载最高画质并完整解码检查音视频轨道；完整 MP4 直接上传原文件（包括 AV1/VP9，不重新编码、不降低分辨率）。只有非 MP4 文件才转换为 H.264/yuv420p + AAC 的 MP4
 3. 下载封面，裁成 1280×720 JPEG；失败则从视频抽帧  
-4. DeepL Free 翻译标题和简介（已是中文则跳过），标题截到 80 字  
+4. 按用户选择的优先级翻译标题和简介（默认本地，失败可切换 DeepL；已是中文则跳过），标题截到 80 字
 5. 调用 `biliup upload` 提交稿件（创作声明：内容无需标注）  
 
 `--dry-run` 在第 5 步之前停下并保留文件。Cookie 过期时重新 `login`。上传成功并获得 BV 号后，自动删除当前任务的 `work\<video_id>\` 目录（含源视频、封面、临时文件及隔离的旧文件），保留数据库中的任务记录和 BV 号。上传失败或未解析到 BV 号时保留文件；清理失败也不会把已提交的任务改成上传失败。投稿成功不代表平台转码或审核成功，删除后若平台处理失败，需要重新下载。

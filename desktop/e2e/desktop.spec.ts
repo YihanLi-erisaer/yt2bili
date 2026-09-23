@@ -1,5 +1,45 @@
 import { test, expect } from "@playwright/test";
 
+test("local-first translation settings and fallback can be changed", async ({
+  page,
+}) => {
+  await page.goto("/?preview");
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await expect(page.getByLabel("首选翻译服务")).toHaveValue("local_llm");
+  await page.getByLabel("首选翻译服务").selectOption("deepl");
+  await expect(page.getByLabel("首选翻译服务")).toHaveValue("deepl");
+  await page.getByLabel("首选失败时使用另一服务").uncheck();
+  await expect(page.getByLabel("首选失败时使用另一服务")).not.toBeChecked();
+  await expect(page.getByText(/不自动切换/)).toBeVisible();
+});
+
+test("first-run accepts local test without a DeepL key", async ({ page }) => {
+  await page.goto("/?preview");
+  await page.getByRole("button", { name: "开始配置" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "下一步" }).click();
+  await dialog.getByRole("button", { name: "下一步" }).click();
+  await expect(dialog.getByRole("button", { name: "下一步" })).toBeDisabled();
+  await dialog.getByRole("button", { name: "本地试译", exact: true }).click();
+  await expect(
+    dialog.getByText("更好的工作流", { exact: false }),
+  ).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "下一步" })).toBeEnabled();
+  await expect(dialog.getByLabel("DeepL API 密钥")).toHaveValue("");
+});
+
+test("retranslation requires explicit replacement confirmation", async ({
+  page,
+}) => {
+  await page.goto("/?preview&populated");
+  await page.getByRole("button", { name: /用更少的工具/ }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "按当前设置重新翻译" }).click();
+  await expect(dialog).toContainText("含人工修改");
+  await dialog.getByRole("button", { name: "确认", exact: true }).click();
+  await expect(dialog.getByLabel(/中文标题/)).toHaveValue("重新翻译的标题");
+});
+
 test("first-run guide starts with storage selection", async ({ page }) => {
   await page.goto("/?preview");
   await page.getByRole("button", { name: "开始配置" }).click();

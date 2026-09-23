@@ -6,6 +6,7 @@ from pathlib import Path
 
 from yt2bili.config import Settings
 from yt2bili.exceptions import Yt2BiliError
+from yt2bili.translation.config import DEFAULTS, validate as validate_translation, legacy_snapshot
 
 
 def atomic_json(path: Path, value):
@@ -29,12 +30,15 @@ class DesktopSettings:
             vault = keyring
         self.vault = vault
         self.vault_service = "StarDazz.yt2bili:" + str(paths.root)
+        self.translation_upgrade_notice = False
         self.values = dict(work_dir=str(paths.root / "work"), bili_tid=171, bili_tags="转载",
                            bili_line="tx", upload_gap_seconds=20, theme="system",
-                           hwaccel="auto", validation_cache=True)
+                           hwaccel="auto", validation_cache=True, **DEFAULTS)
         if self.path.exists():
             try:
-                self.values.update(self.validate(json.loads(self.path.read_text(encoding="utf-8"))))
+                saved = json.loads(self.path.read_text(encoding="utf-8"))
+                self.translation_upgrade_notice = "translation_primary" not in saved
+                self.values.update(self.validate(saved))
             except (ValueError, TypeError, Yt2BiliError) as exc:
                 raise Yt2BiliError("设置文件无效，请从备份恢复 settings.json。") from exc
 
@@ -60,13 +64,19 @@ class DesktopSettings:
             has_key, vault_error = bool(self.key()), ""
         except Yt2BiliError as exc:
             has_key, vault_error = False, str(exc)
-        return {**self.values, "has_deepl_key": has_key, "vault_error": vault_error,
+        from yt2bili.translation.runtime import status
+        local_ready = status(self.values, self.paths.root / "translation")["state"] == "ready"
+        primary_ready = local_ready if self.values["translation_primary"] == "local_llm" else has_key
+        ready = primary_ready or (self.values["translation_fallback_enabled"] and (local_ready or has_key))
+        return {**self.values, "has_deepl_key": has_key, "vault_error": vault_error, "translation_ready": bool(ready),
+                "translation_upgrade_notice": self.translation_upgrade_notice,
                 "data_dir": str(self.paths.root), "youtube_cookies": (self.paths.root / "secrets/youtube_cookies.txt").is_file()}
 
     def validate(self, incoming):
         if not isinstance(incoming, dict) or set(incoming) - set(self.values):
             raise Yt2BiliError("包含不支持的设置项。")
         merged = {**self.values, **incoming}
+        merged.update(validate_translation(merged))
         for name, lo, hi in (("bili_tid", 1, 65535), ("upload_gap_seconds", 0, 600)):
             if type(merged[name]) is not int or not lo <= merged[name] <= hi:
                 raise Yt2BiliError(f"{name} 必须在 {lo}～{hi} 之间。")
@@ -96,19 +106,21 @@ class DesktopSettings:
         probe.unlink()
         atomic_json(self.path, value)
         self.values = value
+        self.translation_upgrade_notice = False
         return self.public()
 
     def snapshot(self):
         return dict(self.values)
 
     def build(self, snapshot=None):
-        value = snapshot or self.values
+        value = legacy_snapshot(snapshot) if snapshot else self.values
         root = self.paths.root
         cookie = root / "secrets/youtube_cookies.txt"
-        return Settings(root=root, deepl_auth_key=self.key(),
+        return Settings(root=root, deepl_auth_key="", deepl_key_provider=self.key,
                         bili_cookies=root / "secrets/bili_cookies.json", biliup_bin=None,
                         youtube_cookies=cookie if cookie.is_file() else None, youtube_cookies_from_browser=None,
                         bili_tid=value["bili_tid"], bili_tags=value["bili_tags"], bili_line=value["bili_line"],
                         upload_gap_seconds=value["upload_gap_seconds"], work_dir=Path(value["work_dir"]),
-                        data_dir=root / "data", bin_dir=self.paths.resources / "bin")
+                        data_dir=root / "data", bin_dir=self.paths.resources / "bin",
+                        translation_root=root / "translation", **validate_translation(value))
 

@@ -61,6 +61,7 @@ import {
   type Task,
 } from "./types";
 import SetupWizard from "./SetupWizard";
+import TranslationPanel from "./TranslationPanel";
 
 type Page = "tasks" | "history" | "account" | "settings";
 type Notice = { kind: "success" | "error"; text: string };
@@ -540,7 +541,7 @@ export default function App() {
                     ))}
                   </div>
                 )}
-                {config && !config.has_deepl_key && page === "tasks" && (
+                {config && !config.translation_ready && page === "tasks" && (
                   <div className="setup-banner">
                     <div className="setup-icon">
                       <Zap size={20} />
@@ -548,7 +549,7 @@ export default function App() {
                     <div>
                       <strong>先完成一次简单的配置</strong>
                       <p>
-                        添加 DeepL 密钥并连接 B
+                        配置本地翻译或 DeepL 并连接 B
                         站账号，之后就可以在这里管理任务。
                       </p>
                     </div>
@@ -1096,8 +1097,10 @@ function TaskDetail({
         <div className="detail-progress">
           <span>
             {labels[progress?.stage || task.status]}
-            {progress?.track &&
-              ` · ${progress.track} · ${progress.backend}`}{" "}
+            {progress?.provider
+              ? ` · ${progress.provider === "local_llm" ? "本地大模型" : "DeepL"}`
+              : ""}
+            {progress?.track && ` · ${progress.track} · ${progress.backend}`}{" "}
             {progress?.remaining
               ? `· 剩余 ${Math.ceil(progress.remaining)} 秒`
               : ""}
@@ -1114,6 +1117,27 @@ function TaskDetail({
             />
           </div>
         </div>
+      )}
+      {task.translation && (
+        <p className="help">
+          翻译来源：
+          {
+            (
+              {
+                local_llm: "本地大模型",
+                deepl: "DeepL",
+                none: "无需翻译",
+                unknown: "历史译文",
+              } as Record<string, string>
+            )[task.translation.provider || "unknown"]
+          }
+          {task.translation.fallback_used &&
+            ` · 已切换服务（${task.translation.fallback_reason}）`}
+          {task.translation.elapsed_ms != null &&
+            ` · ${(task.translation.elapsed_ms / 1000).toFixed(1)} 秒`}
+          {task.translation.user_edited && " · 已人工修改"}
+          {task.translation.input_truncated && " · 原文片段已截短"}
+        </p>
       )}
       <div className="tabs detail-tabs">
         <button
@@ -1246,14 +1270,43 @@ function TaskDetail({
           </button>
         </div>
       )}
+      {editable(task) && (
+        <button
+          className="text-button"
+          disabled={busy}
+          onClick={() => setConfirm("retranslate")}
+        >
+          按当前设置重新翻译
+        </button>
+      )}
+      {retryable(task) && (
+        <button
+          className="text-button"
+          disabled={busy}
+          onClick={() =>
+            void action(async () => {
+              await request("tasks.retry", {
+                video_id: task.video_id,
+                operation_id: operationId(),
+                use_current_translation_settings: true,
+              });
+              await refresh();
+            }, "已使用当前翻译设置继续准备素材。")
+          }
+        >
+          使用当前翻译设置重试
+        </button>
+      )}
       {confirm && (
         <div className="confirm-box">
           <strong>
-            {confirm === "submit"
-              ? "确认将当前素材投稿到 B 站？"
-              : confirm === "repair"
-                ? "准备原稿件的替换视频？此操作不会投稿。"
-                : "确认创作中心没有这条稿件？"}
+            {confirm === "retranslate"
+              ? "重新翻译将替换当前标题和简介（含人工修改），成功后返回预览，是否继续？"
+              : confirm === "submit"
+                ? "确认将当前素材投稿到 B 站？"
+                : confirm === "repair"
+                  ? "准备原稿件的替换视频？此操作不会投稿。"
+                  : "确认创作中心没有这条稿件？"}
           </strong>
           <div>
             <button className="secondary" onClick={() => setConfirm("")}>
@@ -1263,18 +1316,28 @@ function TaskDetail({
               className="primary"
               disabled={busy}
               onClick={() =>
-                confirm === "submit"
-                  ? command("tasks.submit", "已进入投稿队列。")
-                  : confirm === "repair"
-                    ? command("tasks.repair", "已开始准备替换素材。")
-                    : action(async () => {
-                        await request("tasks.resolve", {
-                          video_id: task.video_id,
-                          not_submitted: true,
-                        });
-                        setConfirm("");
-                        await refresh();
-                      }, "已标记为可继续处理。")
+                confirm === "retranslate"
+                  ? action(async () => {
+                      await request("tasks.retranslate", {
+                        video_id: task.video_id,
+                        operation_id: operationId(),
+                        replace_edited: true,
+                      });
+                      setConfirm("");
+                      await refresh();
+                    }, "已开始重新翻译，完成后等待预览。")
+                  : confirm === "submit"
+                    ? command("tasks.submit", "已进入投稿队列。")
+                    : confirm === "repair"
+                      ? command("tasks.repair", "已开始准备替换素材。")
+                      : action(async () => {
+                          await request("tasks.resolve", {
+                            video_id: task.video_id,
+                            not_submitted: true,
+                          });
+                          setConfirm("");
+                          await refresh();
+                        }, "已标记为可继续处理。")
               }
             >
               确认
@@ -1355,7 +1418,6 @@ function Account({
   refresh: () => Promise<void>;
   setAuth: (v: any) => void;
 }) {
-  const [key, setKey] = useState("");
   const [showLogin, setShowLogin] = useState(false);
   const [browser, setBrowser] = useState("edge");
   const login = auth.login || {};
@@ -1438,72 +1500,12 @@ function Account({
           </div>
         </div>
       </section>
-      <section className="settings-card">
-        <div className="section-title">
-          <div className="service-icon">
-            <span className="deepl-mark">D</span>
-          </div>
-          <div>
-            <h2>DeepL 翻译</h2>
-            <p>将视频标题与简介翻译为中文。</p>
-          </div>
-          <span className={`pill ${config.has_deepl_key ? "positive" : ""}`}>
-            {config.has_deepl_key ? "已配置" : "未配置"}
-          </span>
-        </div>
-        <div className="section-body">
-          <label className="field">
-            API 密钥
-            <div className="inline-controls">
-              <input
-                type="password"
-                autoComplete="off"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                placeholder={
-                  config.has_deepl_key
-                    ? "已安全保存，输入新密钥可替换"
-                    : "输入你的 DeepL API Free 密钥"
-                }
-              />
-              <button
-                className="primary"
-                disabled={busy || !key.trim()}
-                onClick={() =>
-                  action(async () => {
-                    await request("credentials.set", { value: key });
-                    setKey("");
-                    await refresh();
-                  }, "密钥已保存到系统凭据存储。")
-                }
-              >
-                保存密钥
-              </button>
-            </div>
-          </label>
-          <div className="button-row">
-            <span className="help">
-              <ShieldCheck size={13} />
-              保存在系统凭据存储，不写入普通配置文件。
-            </span>
-            <button
-              className="text-button"
-              disabled={busy || !config.has_deepl_key}
-              onClick={() =>
-                action(async () => {
-                  const result = await request("credentials.test");
-                  if (!result.ok) throw new Error("连接失败");
-                }, "DeepL 连接正常。")
-              }
-            >
-              测试连接
-            </button>
-          </div>
-          {config.vault_error && (
-            <div className="inline-error">{config.vault_error}</div>
-          )}
-        </div>
-      </section>
+      <TranslationPanel
+        config={config}
+        busy={busy}
+        action={action}
+        refresh={refresh}
+      />
       <section className="settings-card">
         <div className="section-title">
           <div className="service-icon">
@@ -1633,6 +1635,12 @@ function Settings({
     setForm((old) => ({ ...old, [key]: value }));
   return (
     <div className="settings-stack">
+      <TranslationPanel
+        config={config}
+        busy={busy}
+        action={action}
+        refresh={refresh}
+      />
       <section className="settings-card">
         <div className="section-title">
           <div>
