@@ -1,4 +1,5 @@
 import { useState } from "react";
+import TranslationPanel from "./TranslationPanel";
 import { ArrowRight, CheckCircle2, FolderOpen, RefreshCw } from "lucide-react";
 import { chooseDirectory, request } from "./bridge";
 import { bytes, type Config } from "./types";
@@ -24,7 +25,6 @@ export default function SetupWizard({
 }) {
   const [step, setStep] = useState(0);
   const [folder, setFolder] = useState(config.work_dir);
-  const [key, setKey] = useState("");
   const [checkedKey, setCheckedKey] = useState(false);
   const labels = ["素材目录", "运行环境", "翻译服务", "投稿账号"];
   const readyTools =
@@ -109,47 +109,13 @@ export default function SetupWizard({
         </>
       )}
       {step === 2 && (
-        <>
-          <p className="help">
-            DeepL 密钥保存在系统凭据存储中。保存并检测后继续。
-          </p>
-          <label className="field-label" htmlFor="wizard-key">
-            DeepL API 密钥
-          </label>
-          <input
-            id="wizard-key"
-            type="password"
-            autoComplete="off"
-            placeholder={
-              config.has_deepl_key
-                ? "已保存；留空沿用现有密钥"
-                : "输入 DeepL API 密钥"
-            }
-            value={key}
-            onChange={(e) => {
-              setKey(e.target.value);
-              setCheckedKey(false);
-            }}
-          />
-          <button
-            className="secondary"
-            disabled={busy || (!key && !config.has_deepl_key)}
-            onClick={() =>
-              action(async () => {
-                if (key) {
-                  await request("credentials.set", { value: key });
-                  setKey("");
-                }
-                await request("credentials.test");
-                setCheckedKey(true);
-                await refresh();
-              }, "DeepL 连接正常。")
-            }
-          >
-            保存并检测连接
-          </button>
-          {checkedKey && <p className="help">连接正常，可以继续。</p>}
-        </>
+        <TranslationPanel
+          config={config}
+          busy={busy}
+          action={action}
+          refresh={refresh}
+          onReady={setCheckedKey}
+        />
       )}
       {step === 3 && (
         <>

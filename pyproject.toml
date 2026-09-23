@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "yt-dlp[default]>=2026.8.19",
-    "deepl>=1.18.0",
+    "deepl==1.32.0",
     "python-dotenv>=1.0.0",
     "Pillow>=10.0.0",
 ]
@@ -24,3 +24,6 @@ desktop = ["keyring>=25,<26", "qrcode[pil]>=8,<9"]
 
 [tool.setuptools.packages.find]
 include = ["yt2bili*"]
+
+[tool.setuptools.package-data]
+"yt2bili.translation" = ["manifest.json"]

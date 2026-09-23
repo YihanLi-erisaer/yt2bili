@@ -74,7 +74,7 @@ class AccountLane:
             item = next((i for i in items if i.cancel.is_set()), None)
             action = "cancel"
             if item is None:
-                head = next((i for i in items if i.mode != "preview"), None)
+                head = next((i for i in items if i.mode not in ("preview", "retranslate")), None)
                 if head and head.assets_complete and (not head.wait_reason or
                         head.deadline is not None and time.monotonic() >= head.deadline):
                     item, action = head, "submit"
@@ -95,11 +95,16 @@ class AccountLane:
                         task = self.scheduler.store.require(item.task_id)
                         item.job.task = task
                         with pipeline._job_context(item.job):
-                            pipeline._prepare_assets(item.settings, self.scheduler.store, task,
-                                item.job.meta, item.job.work_dir, Path(task.video_path))
+                            if item.mode == "retranslate":
+                                from yt2bili.translation.tasks import prepare
+                                self.scheduler.store.update(item.task_id, status="translating")
+                                prepare(item.settings, self.scheduler.store, task, item.job.meta, item.job.work_dir, force=True)
+                            else:
+                                pipeline._prepare_assets(item.settings, self.scheduler.store, task,
+                                    item.job.meta, item.job.work_dir, Path(task.video_path))
                         events.check_cancelled()
                         item.assets_complete = True
-                        if item.mode == "preview":
+                        if item.mode in ("preview", "retranslate"):
                             self.scheduler.store.update(item.task_id, status="ready", wait_reason="")
                             finished = True
                         else:
@@ -193,7 +198,7 @@ class Scheduler:
             if not task.work_dir:
                 task.work_dir = str(Path(task.work_root) / task.task_id)
             validate_task_paths(task)
-            original = task.status if repair else ""
+            original = task.status if repair or mode == "retranslate" else ""
             task.status = {"download": "queued_download", "validate": "queued_validation", "upload": "queued_upload"}[stage]
             task.error, task.wait_reason, task.cancel_requested = "", "", 0
             self.store._conn.execute("UPDATE tasks SET cancel_requested=0 WHERE task_id=?", (task.task_id,))
@@ -333,7 +338,7 @@ class Scheduler:
 
     def fail(self, item, exc):
         current = self.store.require(item.task_id)
-        status = item.payload["original_status"] if item.mode == "repair" else (
+        status = item.payload["original_status"] if item.mode in ("repair", "retranslate") else (
             current.status if current.status in ("submitted", "submission_unknown") else
             "submission_unknown" if current.status == "uploading" else
             "cancelled" if item.cancel.is_set() else "failed")

@@ -23,6 +23,16 @@ export interface Task {
   updated_at: string;
   snapshot?: { mode: string; settings: Record<string, unknown> };
   file_exists?: boolean;
+  translation?: {
+    state?: string;
+    provider?: string;
+    model_digest?: string;
+    fallback_used?: boolean;
+    fallback_reason?: string;
+    elapsed_ms?: number;
+    user_edited?: boolean;
+    input_truncated?: boolean;
+  };
 }
 export interface Config {
   work_dir: string;
@@ -37,6 +47,13 @@ export interface Config {
   data_dir: string;
   youtube_cookies: boolean;
   vault_error: string;
+  translation_primary: "local_llm" | "deepl";
+  translation_fallback_enabled: boolean;
+  translation_ready: boolean;
+  translation_upgrade_notice?: boolean;
+  local_llm_mode: "managed" | "external";
+  local_llm_base_url: string;
+  local_llm_model: string;
 }
 export interface Progress {
   task_id?: string;
@@ -48,6 +65,7 @@ export interface Progress {
   remaining?: number;
   track?: string;
   backend?: string;
+  provider?: string;
 }
 export const labels: Record<string, string> = {
   pending: "等待处理",
@@ -69,6 +87,8 @@ export const labels: Record<string, string> = {
   submission_unknown: "待核对",
   hashing: "读取文件指纹",
   upload_wait: "等待上传间隔",
+  translation_wait: "等待翻译服务",
+  translation_fallback: "切换翻译服务",
 };
 export const editable = (task: Task) => task.status === "ready";
 export const retryable = (task: Task) =>

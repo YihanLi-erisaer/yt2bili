@@ -336,5 +336,5 @@ class InputAndMigrationTests(unittest.TestCase):
                 self.assertEqual((task.title_zh, task.bv_id), ("手工标题", "BV1234567890"))
                 self.assertEqual(store.get_job(task.task_id)["mode"], "auto")
                 with self.assertRaises(Yt2BiliError): store.operation("old-op", "tasks.create", request_hash="new")
-                self.assertTrue(Path(str(path)+".pre-multi-account.bak").is_file())
+                self.assertTrue(Path(str(path)+".pre-v3.bak").is_file())
             finally: store.close()

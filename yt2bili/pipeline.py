@@ -95,6 +95,8 @@ def _download_job(settings, store, job: _PipelineJob, force: bool, seen_ids: set
                 raise Yt2BiliError(f"无法清理强制重做的任务目录：{job.work_dir}")
         job.work_dir.mkdir(parents=True, exist_ok=True)
         job.task = existing if existing and not force else Task(meta.video_id, meta.webpage_url, "pending")
+        if force:
+            store.reset_translation(meta.video_id)
         job.task.url = meta.webpage_url
         job.task.work_dir = str(job.work_dir)
         job.task.title_orig = meta.title
@@ -411,6 +413,7 @@ def _run_one(
         task = existing or Task(video_id=meta.video_id, url=meta.webpage_url, status="pending")
         if force:
             task = Task(video_id=meta.video_id, url=meta.webpage_url, status="pending")
+            store.reset_translation(meta.video_id)
         task.url = meta.webpage_url
         task.work_dir = str(work_dir)
         log_path = work_dir / "pipeline.log"
@@ -521,40 +524,17 @@ def _prepare_assets(settings, store, task, meta, work_dir: Path, video_path: Pat
 
     task.status = "translating"
     store.upsert(task)
-    if not task.title_zh:
-        footer_reserve = 80 + len(meta.title) + len(meta.uploader) + len(meta.webpage_url)
-        body_limit = max(200, settings.desc_limit - footer_reserve)
-        with _translation_slot():
-            title_zh, desc_zh = translate.translate_title_and_desc(
-                settings.deepl_auth_key,
-                meta.title,
-                meta.description,
-                meta.language,
-                settings.title_limit,
-                body_limit,
-            )
-        task.title_zh = title_zh
-        task.desc_zh = translate.build_description(
-            desc_zh,
-            meta.title,
-            meta.uploader,
-            meta.webpage_url,
-            settings.desc_limit,
-        )
-        store.upsert(task)
-    else:
-        log.info("已有中文标题，跳过翻译。")
-
-    (work_dir / "title.txt").write_text(task.title_zh, encoding="utf-8")
-    (work_dir / "desc.txt").write_text(task.desc_zh, encoding="utf-8")
-    log.info("中文标题：%s", task.title_zh)
-    log.info("简介预览：\n%s", task.desc_zh)
+    from yt2bili.translation.tasks import prepare
+    prepare(settings, store, task, meta, work_dir)
+    log.info("翻译素材已就绪：标题 %s 字，简介 %s 字。", len(task.title_zh), len(task.desc_zh))
 
 
 def _submit_ready(settings, store, task, meta, work_dir: Path, *, dry_run: bool) -> Task:
     log = logging.getLogger(f"yt2bili.task.{task.task_id or task.video_id}")
     video_path = Path(task.video_path)
     cover_path = Path(task.cover_path)
+    from yt2bili.translation.tasks import sync_files
+    sync_files(task, work_dir)
     if dry_run:
         task.status = "ready"
         log.info("dry-run：已跳过 B 站上传。")

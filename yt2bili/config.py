@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 @dataclass(frozen=True)
 class Settings:
     root: Path
-    deepl_auth_key: str
+    deepl_auth_key: str = field(repr=False)
     bili_cookies: Path
     biliup_bin: Path | None
     youtube_cookies: Path | None
@@ -31,10 +32,21 @@ class Settings:
     cover_height: int = 720
     account_id: str | None = None
     account_uid: str | None = None
+    translation_primary: str = "local_llm"
+    translation_fallback_enabled: bool = True
+    local_llm_mode: str = "managed"
+    local_llm_base_url: str = "http://127.0.0.1:11435"
+    local_llm_model: str = "qwen3:8b"
+    local_llm_num_ctx: int = 8192
+    local_llm_timeout_seconds: int = 120
+    translation_total_timeout_seconds: int = 240
+    translation_root: Path | None = None
+    deepl_key_provider: Callable[[], str] | None = field(default=None, repr=False, compare=False)
 
 
 def load_settings() -> Settings:
     load_dotenv(ROOT / ".env")
+    from yt2bili.translation.config import from_env
 
     bili_cookies = Path(os.getenv("BILI_COOKIES", str(ROOT / "secrets" / "bili_cookies.json")))
     if not bili_cookies.is_absolute():
@@ -88,6 +100,7 @@ def load_settings() -> Settings:
         bin_dir=bin_dir,
         download_jobs=download_jobs,
         upload_gap_seconds=upload_gap_seconds,
+        **from_env(),
     )
 
 

@@ -54,6 +54,27 @@ def main(argv=None):
 
 
 def _dispatch(args, service):
+    command, settings = args.command, service.config.build()
+    if command == "translation":
+        import json
+        from dataclasses import asdict, replace
+        from yt2bili.translation.config import snapshot, component_root
+        from yt2bili.translation.runtime import status
+        from yt2bili.translation.deployment import install, export_bundle
+        from yt2bili.translation.service import translate as translate_group
+        root, config = component_root(settings), snapshot(settings)
+        if args.translation_command == "setup":
+            result = install(config, root, offline_path=args.offline)
+        elif args.translation_command == "export":
+            result = export_bundle(root, args.path)
+        elif args.translation_command == "test":
+            selected = replace(settings, translation_primary=args.provider, translation_fallback_enabled=False)
+            result = asdict(translate_group(selected, "A better workflow", "Build useful tools. Keep version 2.0.", "en", 80, 1000))
+        else:
+            result = {"primary": config["translation_primary"], "fallback_enabled": config["translation_fallback_enabled"], "local": status(config, root)}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
     if args.command == "accounts":
         if args.account_command == "list":
             for account in service.accounts.list(True):
@@ -87,7 +108,8 @@ def _dispatch(args, service):
             return 0
     else:
         task_id = service.task(args.task_id).task_id
-        getattr(service, args.command)(task_id, op)
+        options = {"use_current_translation_settings": args.use_current_translation_settings} if args.command == "retry" else {}
+        getattr(service, args.command)(task_id, op, **options)
     logger.info("任务 %s 已加入队列；取消请按 Ctrl+C。", task_id)
     while (service.store.get_job(task_id) or {}).get("execution_state") in ("queued", "running", "waiting"):
         time.sleep(.2)
@@ -111,6 +133,16 @@ def _build_parser():
     parser.add_argument("--data-dir", help="账号与任务数据目录；默认项目目录")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("setup")
+    translation = sub.add_parser("translation", help="安装、检测和试译本地翻译组件")
+    translation_sub = translation.add_subparsers(dest="translation_command", required=True)
+    setup_translation = translation_sub.add_parser("setup", help="下载约 7 GB 组件，安装前检查磁盘空间")
+    setup_translation.add_argument("--offline", help="导入本产品导出的离线组件 ZIP")
+    translation_sub.add_parser("status", help="检查翻译配置及本地组件")
+    test_translation = translation_sub.add_parser("test", help="用固定短句试译；DeepL 会消耗少量额度")
+    test_translation.add_argument("--provider", choices=("local_llm", "deepl"), default="local_llm")
+    export_translation = translation_sub.add_parser("export", help="导出已校验的离线组件包")
+    export_translation.add_argument("path", help="保存 ZIP 的路径")
+
     yt = sub.add_parser("youtube-cookies")
     yt.add_argument("--browser", default=None)
     sub.add_parser("list").add_argument("--account")
@@ -136,6 +168,7 @@ def _build_parser():
         cmd.add_argument("task_id", help="任务 UUID；兼容无歧义的旧视频 ID")
         if command == "retry":
             cmd.add_argument("--dry-run", action="store_true", help="继续后始终进入预览")
+            cmd.add_argument("--use-current-translation-settings", action="store_true")
     return parser
 
 
@@ -147,7 +180,7 @@ def _protect_retry_video_id(argv: list[str]) -> list[str]:
     rest = argv[idx + 1 :]
     if "--" in rest:
         return argv
-    flags = {"-h", "--help", "--dry-run"}
+    flags = {"-h", "--help", "--dry-run", "--use-current-translation-settings"}
     video_id: str | None = None
     options: list[str] = []
     extras: list[str] = []

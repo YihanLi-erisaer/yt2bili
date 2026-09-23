@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from yt2bili.exceptions import Yt2BiliError
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STATUSES = ("pending", "fetching_meta", "downloading", "queued_download", "queued_validation",
             "validating", "queued_upload", "processing_cover", "translating", "ready", "uploading",
             "submitted", "failed", "cancel_requested", "cancelled", "interrupted", "submission_unknown")
@@ -67,7 +67,7 @@ class TaskStore:
                 raise Yt2BiliError("检测到其他分支的同版本数据库，请先进行联合迁移；原库未修改。")
         if version < SCHEMA_VERSION:
             if db_path.stat().st_size:
-                suffix = ".pre-desktop.bak" if version == 0 else ".pre-multi-account.bak"
+                suffix = ".pre-desktop.bak" if version == 0 else ".pre-v3.bak"
                 backup_path = Path(str(db_path) + suffix)
                 if backup_path.exists():
                     backup_path = Path(str(backup_path) + "." + uuid.uuid4().hex)
@@ -82,12 +82,18 @@ class TaskStore:
     def _migrate(self):
         with self.transaction():
             tables = {r[0] for r in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            columns = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+            if "task_id" in columns:
+                self._translation_schema()
+                self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self._conn.execute("INSERT OR REPLACE INTO schema_migrations VALUES(?,?)", (SCHEMA_VERSION, _now()))
+                return
             old = [dict(r) for r in self._conn.execute("SELECT * FROM tasks")] if "tasks" in tables else []
             jobs = [dict(r) for r in self._conn.execute("SELECT * FROM desktop_jobs")] if "desktop_jobs" in tables else []
             operations = [dict(r) for r in self._conn.execute("SELECT * FROM desktop_operations")] if "desktop_operations" in tables else []
-            if {"task_translation", "translation_attempts"} & tables:
-                raise Yt2BiliError("检测到翻译扩展数据库，请使用包含联合迁移的版本；原库未修改。")
-            for name in ("desktop_jobs", "desktop_operations", "tasks"):
+            translations = [dict(r) for r in self._conn.execute("SELECT * FROM task_translation")] if "task_translation" in tables else []
+            attempts = [dict(r) for r in self._conn.execute("SELECT * FROM translation_attempts ORDER BY id")] if "translation_attempts" in tables else []
+            for name in ("task_translation", "translation_attempts", "desktop_jobs", "desktop_operations", "tasks"):
                 self._conn.execute(f"DROP TABLE IF EXISTS {name}")
             for sql in (
                 """CREATE TABLE bilibili_accounts (
@@ -152,11 +158,55 @@ class TaskStore:
                     self._conn.execute("INSERT INTO desktop_jobs VALUES(?,?)", (mapping[job["video_id"]], job["payload"]))
             for op in operations:
                 self._conn.execute("INSERT INTO legacy_operations VALUES(?,?,?)", (op["id"], op["method"], op["result"]))
+            self._translation_schema()
+            for row in translations:
+                if row["video_id"] in mapping:
+                    self._conn.execute("INSERT OR REPLACE INTO task_translation VALUES(?,?)", (mapping[row["video_id"]], row["payload"]))
+            for row in attempts:
+                if row["video_id"] in mapping:
+                    self._conn.execute("INSERT INTO translation_attempts(task_id,payload) VALUES(?,?)", (mapping[row["video_id"]], row["payload"]))
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn.execute("INSERT INTO schema_migrations VALUES(?,?)", (SCHEMA_VERSION, _now()))
             if self._conn.execute("PRAGMA foreign_key_check").fetchone():
                 raise Yt2BiliError("数据库迁移引用检查失败。")
             self._events.clear()
+
+    def _translation_schema(self):
+        from yt2bili.translation.config import legacy_snapshot
+        self._conn.execute("CREATE TABLE IF NOT EXISTS task_translation(task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),payload TEXT NOT NULL)")
+        self._conn.execute("CREATE TABLE IF NOT EXISTS translation_attempts(id INTEGER PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(task_id),payload TEXT NOT NULL)")
+        for row in self._conn.execute("SELECT task_id,payload FROM desktop_jobs").fetchall():
+            job = json.loads(row["payload"])
+            job["settings"] = legacy_snapshot(job.get("settings", {}))
+            self._conn.execute("UPDATE desktop_jobs SET payload=? WHERE task_id=?", (json.dumps(job, ensure_ascii=False), row["task_id"]))
+        for row in self._conn.execute("SELECT task_id,title_zh FROM tasks").fetchall():
+            record = {"config_snapshot": legacy_snapshot({})}
+            if row["title_zh"]:
+                record.update(state="legacy_preserved", provider="unknown", user_edited=False)
+            self._conn.execute("INSERT OR IGNORE INTO task_translation VALUES(?,?)", (row["task_id"], json.dumps(record)))
+
+    def translation(self, identity):
+        with self._lock:
+            task = self.get(identity)
+            row = self._conn.execute("SELECT payload FROM task_translation WHERE task_id=?", (task.task_id,)).fetchone() if task else None
+            return json.loads(row[0]) if row else None
+
+    def reset_translation(self, identity):
+        with self.transaction() as conn:
+            task = self.get(identity)
+            if task:
+                conn.execute("DELETE FROM task_translation WHERE task_id=?", (task.task_id,))
+
+    def save_translation(self, task, record):
+        with self.transaction() as conn:
+            self.upsert(task)
+            conn.execute("INSERT OR REPLACE INTO task_translation VALUES(?,?)", (task.task_id, json.dumps(record, ensure_ascii=False)))
+
+    def translation_attempt(self, identity, attempts):
+        with self.transaction() as conn:
+            task_id = self.require(identity).task_id
+            conn.execute("INSERT INTO translation_attempts(task_id,payload) VALUES(?,?)", (task_id, json.dumps({"time": _now(), "attempts": attempts})))
+            conn.execute("DELETE FROM translation_attempts WHERE task_id=? AND id NOT IN (SELECT id FROM translation_attempts WHERE task_id=? ORDER BY id DESC LIMIT 20)", (task_id, task_id))
 
     @contextmanager
     def transaction(self):
