@@ -23,6 +23,11 @@ from yt2bili.locking import FileLock, work_lock
 from yt2bili.paths import AppPaths
 
 
+# Windows CI flushes many small SQLite transactions more slowly than a local SSD.
+# These tests assert ordering/state, not a five-second throughput guarantee.
+ASYNC_TIMEOUT = 30
+
+
 class MemoryVault:
     def __init__(self): self.values = {}
     def get_password(self, service, name): return self.values.get((service, name))
@@ -51,11 +56,18 @@ class DesktopTests(unittest.TestCase):
         self.account = self.service.accounts.bind(login_fixture(), verify=False)
         self.service.config.values["upload_gap_seconds"] = 0
 
+    def wait_until(self, predicate, description):
+        deadline = time.monotonic() + ASYNC_TIMEOUT
+        while not predicate():
+            if time.monotonic() >= deadline:
+                tasks = [(t.task_id, t.status, t.wait_reason, t.error)
+                         for t in self.service.store.list_all()]
+                self.fail(f"Timed out waiting for {description}; tasks={tasks}; "
+                          f"queue={self.service.scheduler.snapshot()}")
+            time.sleep(.05)
+
     def wait_idle(self):
-        deadline = time.monotonic() + 5
-        while self.service.scheduler.snapshot()["active"] and time.monotonic() < deadline:
-            time.sleep(.01)
-        self.assertEqual(self.service.scheduler.snapshot()["active"], [])
+        self.wait_until(lambda: not self.service.scheduler.snapshot()["active"], "idle scheduler")
 
     def meta(self, url, settings):
         video_id = parse_urls(url)[0][0]

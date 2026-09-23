@@ -45,6 +45,7 @@ class MultiAccountTests(unittest.TestCase):
     prepare = desktop_tests.DesktopTests.prepare
     upload = desktop_tests.DesktopTests.upload
     wait_idle = desktop_tests.DesktopTests.wait_idle
+    wait_until = desktop_tests.DesktopTests.wait_until
     create = desktop_tests.DesktopTests.create
 
     def add_account(self, uid):
@@ -120,8 +121,9 @@ class MultiAccountTests(unittest.TestCase):
                 first = uid not in calls
                 calls.append(uid)
             if first:
-                entered.wait(8)
-                release.wait(8)
+                entered.wait(desktop_tests.ASYNC_TIMEOUT)
+                if not release.wait(desktop_tests.ASYNC_TIMEOUT):
+                    raise TimeoutError("Test did not release concurrent uploads")
             with lock: running[uid] -= 1
             return "BV1234567890"
         with self.mocks(), patch.object(bili_upload, "upload", side_effect=upload):
@@ -130,7 +132,7 @@ class MultiAccountTests(unittest.TestCase):
             self.wait_idle()
             try:
                 for t in ids: self.service.submit(t, "submit-" + t)
-                entered.wait(8)
+                entered.wait(desktop_tests.ASYNC_TIMEOUT)
                 with lock:
                     self.assertEqual(sum(running.values()), 5)
                     self.assertEqual(len(calls), 5)
@@ -152,10 +154,8 @@ class MultiAccountTests(unittest.TestCase):
             self.service.submit(first, "waiting-login")
             preview = self.create("12345678901")["task_id"]
             second = self.service.create("https://youtu.be/abcdefghijk", "other-account", other["account_id"], "auto")["task_id"]
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if self.service.task(preview).status == "ready" and self.service.task(second).status == "submitted": break
-                time.sleep(.01)
+            self.wait_until(lambda: self.service.task(preview).status == "ready"
+                            and self.service.task(second).status == "submitted", "preview and other account")
             self.assertEqual(self.service.task(first).wait_reason, "auth_required")
             self.assertEqual(self.service.task(preview).status, "ready")
             self.assertEqual(self.service.task(second).status, "submitted")
