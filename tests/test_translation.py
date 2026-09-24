@@ -131,6 +131,13 @@ class TranslationTests(unittest.TestCase):
         with patch.dict("os.environ", {"TRANSLATION_FALLBACK_ENABLED": "false"}, clear=True):
             self.assertIs(from_env()["translation_fallback_enabled"], False)
 
+    def test_default_budget_has_headroom_for_hybrid_local_inference(self):
+        self.assertGreaterEqual(DEFAULTS["local_llm_timeout_seconds"], 300)
+        self.assertGreaterEqual(
+            DEFAULTS["translation_total_timeout_seconds"],
+            DEFAULTS["local_llm_timeout_seconds"] + 90,
+        )
+
     def test_deepl_whole_pair_and_exceptions(self):
         translator = Mock()
         translator.get_usage.return_value.any_limit_reached = False

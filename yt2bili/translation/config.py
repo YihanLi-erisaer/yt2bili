@@ -13,8 +13,11 @@ DEFAULTS = {
     "local_llm_base_url": "http://127.0.0.1:11435",
     "local_llm_model": "qwen3:8b",
     "local_llm_num_ctx": 8192,
-    "local_llm_timeout_seconds": 120,
-    "translation_total_timeout_seconds": 240,
+    # qwen3:8b can take about two minutes for a full metadata pair on a 4 GB
+    # hybrid CPU/GPU system. Keep enough headroom for cold starts and normal
+    # throughput variance while retaining a bounded, cancellable request.
+    "local_llm_timeout_seconds": 300,
+    "translation_total_timeout_seconds": 420,
 }
 
 
