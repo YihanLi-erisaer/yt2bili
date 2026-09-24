@@ -1382,5 +1382,14 @@ pre {
 .translation-panel .field { margin-bottom: 14px; }
 .translation-toggle { display: flex; align-items: center; gap: 8px; }
 .translation-toggle input { width: auto; }
-.translation-job { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+.translation-job {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.translation-job > * { margin: 0; }
 .translation-job p { overflow-wrap: anywhere; }
