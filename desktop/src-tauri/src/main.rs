@@ -16,8 +16,13 @@ struct Worker {
     job: Mutex<Option<usize>>,
 }
 
-#[tauri::command]
-async fn backend_request(worker: State<'_, Worker>, method: String, params: Value) -> Result<Value, String> {
+struct WorkerProcess {
+    child: Option<Child>,
+    #[cfg(windows)]
+    job: Option<usize>,
+}
+
+async fn request_worker(worker: &Worker, method: String, params: Value) -> Result<Value, String> {
     if method.len() > 100 || !params.is_object() { return Err("无效请求".into()); }
     let id = worker.next.fetch_add(1, Ordering::Relaxed).to_string();
     let (tx, rx) = oneshot::channel();
@@ -42,9 +47,58 @@ async fn backend_request(worker: State<'_, Worker>, method: String, params: Valu
 }
 
 #[tauri::command]
+async fn backend_request(worker: State<'_, Worker>, method: String, params: Value) -> Result<Value, String> {
+    request_worker(&worker, method, params).await
+}
+
+fn take_worker_process(worker: &Worker) -> WorkerProcess {
+    worker.stdin.lock().unwrap().take();
+    WorkerProcess {
+        child: worker.child.lock().unwrap().take(),
+        #[cfg(windows)]
+        job: worker.job.lock().unwrap().take(),
+    }
+}
+
+fn reap_worker(mut process: WorkerProcess) {
+    if let Some(mut child) = process.child.take() {
+        for _ in 0..30 {
+            if child.try_wait().ok().flatten().is_some() { return close_worker_job(process); }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    close_worker_job(process);
+}
+
+fn force_stop_worker(mut process: WorkerProcess) {
+    // Exit callbacks run on the UI event thread. Never wait for Python here:
+    // closing the Windows job handle terminates its whole process tree.
+    #[cfg(windows)]
+    if let Some(job) = process.job.take() {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(job as _); }
+    }
+    if let Some(mut child) = process.child.take() { let _ = child.kill(); }
+}
+
+#[cfg(windows)]
+fn close_worker_job(mut process: WorkerProcess) {
+    if let Some(job) = process.job.take() {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(job as _); }
+    }
+}
+
+#[cfg(not(windows))]
+fn close_worker_job(_: WorkerProcess) {}
+
+#[tauri::command]
 async fn finish_close(app: tauri::AppHandle, worker: State<'_, Worker>) -> Result<(), String> {
-    let status = backend_request(worker, "system.shutdown_status".into(), json!({})).await?;
+    let status = request_worker(&worker, "system.shutdown_status".into(), json!({})).await?;
     if status["ready"] != true { return Err("后台仍在收尾，请等待上传完成。".into()); }
+    let process = take_worker_process(&worker);
+    tauri::async_runtime::spawn_blocking(move || reap_worker(process)).await
+        .map_err(|_| "后台退出任务未完成，请重试。".to_string())?;
     app.exit(0);
     Ok(())
 }
@@ -167,17 +221,7 @@ fn main() {
     app.run(|app, event| {
         if let tauri::RunEvent::Exit = event {
             let worker = app.state::<Worker>();
-            worker.stdin.lock().unwrap().take();
-            if let Some(mut child) = worker.child.lock().unwrap().take() {
-                for _ in 0..30 {
-                    if child.try_wait().ok().flatten().is_some() { break; }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                let _ = child.kill(); let _ = child.wait();
-            }
-            #[cfg(windows)] if let Some(job) = worker.job.lock().unwrap().take() {
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(job as _); }
-            };
+            force_stop_worker(take_worker_process(&worker));
         }
     });
 }
