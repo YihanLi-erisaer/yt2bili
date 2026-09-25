@@ -254,6 +254,25 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaises(Yt2BiliError): self.service.update_settings({"upload_gap_seconds": -1})
         with self.assertRaises(Yt2BiliError): self.service.update_settings({"deepl_auth_key": "bad"})
 
+    def test_translation_timeouts_are_persisted_and_public(self):
+        result = self.service.update_settings({
+            "local_llm_timeout_seconds": 240,
+            "translation_total_timeout_seconds": 360,
+        })
+        self.assertEqual(result["local_llm_timeout_seconds"], 240)
+        self.assertEqual(result["translation_total_timeout_seconds"], 360)
+        saved = json.loads((self.paths.root / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["local_llm_timeout_seconds"], 240)
+        self.assertEqual(saved["translation_total_timeout_seconds"], 360)
+        reloaded = DesktopSettings(self.paths, MemoryVault())
+        self.assertEqual(reloaded.values["local_llm_timeout_seconds"], 240)
+        self.assertEqual(reloaded.values["translation_total_timeout_seconds"], 360)
+        with self.assertRaises(Yt2BiliError):
+            self.service.update_settings({
+                "local_llm_timeout_seconds": 400,
+                "translation_total_timeout_seconds": 300,
+            })
+
     def test_local_task_creation_does_not_require_deepl_vault(self):
         self.service.config.set_key("")
         with self.mocks(), patch.object(self.service.config, "key", side_effect=AssertionError("must not read key")):

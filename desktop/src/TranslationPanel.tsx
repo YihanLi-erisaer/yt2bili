@@ -42,6 +42,12 @@ export default function TranslationPanel({
 }) {
   const [key, setKey] = useState("");
   const [address, setAddress] = useState(config.local_llm_base_url);
+  const [localTimeout, setLocalTimeout] = useState(
+    String(config.local_llm_timeout_seconds),
+  );
+  const [totalTimeout, setTotalTimeout] = useState(
+    String(config.translation_total_timeout_seconds),
+  );
   const [local, setLocal] = useState<{ state: string; message: string } | null>(
     null,
   );
@@ -52,6 +58,8 @@ export default function TranslationPanel({
     setLocal((await request("translation.status")).local);
   useEffect(() => {
     setAddress(config.local_llm_base_url);
+    setLocalTimeout(String(config.local_llm_timeout_seconds));
+    setTotalTimeout(String(config.translation_total_timeout_seconds));
     onReady?.(false);
     void readStatus().catch((e) => setError(String(e)));
   }, [
@@ -59,6 +67,8 @@ export default function TranslationPanel({
     config.local_llm_base_url,
     config.translation_primary,
     config.translation_fallback_enabled,
+    config.local_llm_timeout_seconds,
+    config.translation_total_timeout_seconds,
   ]);
   useEffect(() => {
     let alive = true;
@@ -109,6 +119,35 @@ export default function TranslationPanel({
       await request("settings.update", { values });
       await refresh();
     }, "翻译设置已保存，新任务生效。");
+  const saveTimeouts = () => {
+    const localSeconds = Number(localTimeout);
+    const totalSeconds = Number(totalTimeout);
+    if (
+      !Number.isInteger(localSeconds) ||
+      localSeconds < 15 ||
+      localSeconds > 600
+    ) {
+      setError("大模型推理超时必须是 15～600 秒之间的整数。");
+      return;
+    }
+    if (
+      !Number.isInteger(totalSeconds) ||
+      totalSeconds < 30 ||
+      totalSeconds > 1200
+    ) {
+      setError("翻译流程总超时必须是 30～1200 秒之间的整数。");
+      return;
+    }
+    if (totalSeconds <= localSeconds) {
+      setError("翻译流程总超时必须大于大模型推理超时。");
+      return;
+    }
+    setError("");
+    void save({
+      local_llm_timeout_seconds: localSeconds,
+      translation_total_timeout_seconds: totalSeconds,
+    });
+  };
   const start = (method: string, params: Record<string, unknown> = {}) =>
     action(async () => {
       setError("");
@@ -208,6 +247,47 @@ export default function TranslationPanel({
           首次下载约 6.7 GB；安装时需预留约 12 GB 空间。推荐 16 GB
           以上内存，实际速度取决于硬件。安装后可断网翻译，首次请试译验证。
         </p>
+        <h3>翻译超时</h3>
+        <div className="form-grid">
+          <label className="field">
+            大模型推理超时（秒）
+            <input
+              aria-label="大模型推理超时（秒）"
+              type="number"
+              min={15}
+              max={600}
+              step={1}
+              value={localTimeout}
+              disabled={blocked}
+              onChange={(e) => setLocalTimeout(e.target.value)}
+            />
+          </label>
+          <label className="field">
+            翻译流程总超时（秒）
+            <input
+              aria-label="翻译流程总超时（秒）"
+              type="number"
+              min={30}
+              max={1200}
+              step={1}
+              value={totalTimeout}
+              disabled={blocked}
+              onChange={(e) => setTotalTimeout(e.target.value)}
+            />
+          </label>
+        </div>
+        <div className="button-row">
+          <p className="help">
+            推理超时为单次本地模型请求上限；流程总超时涵盖重试和备用服务切换，且必须更长。新设置只影响新任务。
+          </p>
+          <button
+            className="secondary"
+            disabled={blocked}
+            onClick={saveTimeouts}
+          >
+            保存超时设置
+          </button>
+        </div>
         <div className="button-row">
           {config.local_llm_mode === "managed" && (
             <>

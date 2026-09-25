@@ -54,6 +54,8 @@ export interface Config {
   local_llm_mode: "managed" | "external";
   local_llm_base_url: string;
   local_llm_model: string;
+  local_llm_timeout_seconds: number;
+  translation_total_timeout_seconds: number;
 }
 export interface Progress {
   task_id?: string;

@@ -138,6 +138,22 @@ class TranslationTests(unittest.TestCase):
             DEFAULTS["local_llm_timeout_seconds"] + 90,
         )
 
+    def test_custom_timeout_budgets_are_validated(self):
+        value = validate({"local_llm_timeout_seconds": 240,
+                          "translation_total_timeout_seconds": 360})
+        self.assertEqual(value["local_llm_timeout_seconds"], 240)
+        self.assertEqual(value["translation_total_timeout_seconds"], 360)
+        for custom in ({"local_llm_timeout_seconds": 14},
+                       {"local_llm_timeout_seconds": 601,
+                        "translation_total_timeout_seconds": 700},
+                       {"translation_total_timeout_seconds": 1201},
+                       {"local_llm_timeout_seconds": 300,
+                        "translation_total_timeout_seconds": 300},
+                       {"local_llm_timeout_seconds": 120.5,
+                        "translation_total_timeout_seconds": 180}):
+            with self.subTest(custom=custom), self.assertRaises(Exception):
+                validate(custom)
+
     def test_deepl_whole_pair_and_exceptions(self):
         translator = Mock()
         translator.get_usage.return_value.any_limit_reached = False

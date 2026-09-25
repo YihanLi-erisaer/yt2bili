@@ -11,6 +11,13 @@ test("local-first translation settings and fallback can be changed", async ({
   await page.getByLabel("首选失败时使用另一服务").uncheck();
   await expect(page.getByLabel("首选失败时使用另一服务")).not.toBeChecked();
   await expect(page.getByText(/不自动切换/)).toBeVisible();
+  await expect(page.getByLabel("大模型推理超时（秒）")).toHaveValue("300");
+  await expect(page.getByLabel("翻译流程总超时（秒）")).toHaveValue("420");
+  await page.getByLabel("大模型推理超时（秒）").fill("240");
+  await page.getByLabel("翻译流程总超时（秒）").fill("360");
+  await page.getByRole("button", { name: "保存超时设置" }).click();
+  await expect(page.getByLabel("大模型推理超时（秒）")).toHaveValue("240");
+  await expect(page.getByLabel("翻译流程总超时（秒）")).toHaveValue("360");
 });
 
 test("first-run accepts local test without a DeepL key", async ({ page }) => {
