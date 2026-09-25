@@ -1,6 +1,6 @@
 # yt2bili 桌面端 · 第一期
 
-版本：`0.2.0-alpha.1`。第一期提供 React + Tauri 原生桌面开发版本，连接现有 Python 视频业务。Windows 安装器和 macOS DMG 属于后续两期。
+版本：`0.2.0-alpha.1`。提供 React + Tauri 原生桌面应用，连接现有 Python 视频业务。Windows 安装包和免安装应用的使用及构建见 [Windows 安装与打包](../docs/Windows安装与打包.md)。macOS DMG 尚未提供。
 
 ## 在当前电脑启动
 
@@ -40,7 +40,7 @@ npm run desktop
 
 `requirements-desktop-lock.txt` 固定本次验证过的 **Windows / Python 3.12** 依赖，其中包含 Windows 专属包；其他平台开发时先使用 `requirements-desktop.txt`，第三期再生成按平台验证的锁文件。前端与 Rust 分别使用 `package-lock.json`、`Cargo.lock`。
 
-仓库 `bin/` 下准备 `ffmpeg.exe`、`ffprobe.exe`、`biliup.exe`，也可使用 PATH 中的工具。本次本机适配的 biliup 为 `1.2.4`。YouTube 下载还需要可用的 Node.js 或 Deno。开发版不自动下载或偷偷替换这些二进制，环境页会显示实际工具路径及版本。第二期负责统一随包分发。
+仓库 `bin/` 下准备 `ffmpeg.exe`、`ffprobe.exe`、`biliup.exe`，也可使用 PATH 中的工具。本次本机适配的 biliup 为 `1.2.4`。YouTube 下载还需要可用的 Node.js 或 Deno。开发版不自动下载或偷偷替换这些二进制，环境页会显示实际工具路径及版本。Windows 发布构建会随包分发这些工具。
 
 ## 首次使用
 
@@ -117,10 +117,10 @@ npm run test:launcher
 
 测试默认使用本机 Microsoft Edge。`npm run test:e2e` 会自动启动前端开发服务（或复用已有服务）。开发预览 `/?preview&populated` 明确标记示例数据，不调用外部账号，生产构建不会包含预览模块。
 
-原生通信检查：先启动 `npm run dev`，用已安装的 Rust 工具链运行 `cargo build --manifest-path desktop/src-tauri/Cargo.toml`，然后在仓库根目录运行 `scripts/smoke_native.py`。脚本使用独立临时数据目录，在隐藏窗口验证 React → Tauri → Python → React 后自动退出。仅调试构建响应这个测试钩子。
+原生通信检查：先启动 `npm run dev`，用已安装的 Rust 工具链运行 `cargo build --manifest-path desktop/src-tauri/Cargo.toml`，然后在仓库根目录运行 `scripts/smoke_native.py`。脚本使用独立临时数据目录，在隐藏窗口验证 React → Tauri → Python → React 后自动退出。发布版检查使用 `scripts/smoke_native.py --release dist/windows/yt2bili/yt2bili.exe`，不需要 Vite；仅在显式传入 `--smoke-test` 且指定独立数据和报告环境变量时启用测试钩子。
 
 GitHub Actions 工作流 `desktop-ci.yml` 提供 Windows 后台、前端、Rust 和冻结后台验证；本次未触发远程 CI。
 
-## 后续两期边界
+## 发布验证边界
 
-本期生成冻结后台用于兼容性验证，不是完整安装包。第二期还需要将后台、FFmpeg、biliup、JS 运行时纳入安装资源，建立更新和卸载策略、签名及干净 Windows 机器验证。第三期需要 macOS 真机、按架构构建、Keychain/进程退出适配、签名、公证与 DMG 验证。
+Windows 发布构建已将冻结后台、FFmpeg、biliup 和 Node.js 纳入安装资源，提供 NSIS 安装和完整目录免安装版本。仍需代码签名、干净 Windows 机器验证及自动更新。macOS 仍需真机、按架构构建、Keychain/进程退出适配、签名、公证与 DMG 验证。

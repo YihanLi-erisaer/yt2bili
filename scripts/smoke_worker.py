@@ -9,11 +9,12 @@ import tempfile
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--frozen")
+parser.add_argument("--resources", type=Path)
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
 with tempfile.TemporaryDirectory(prefix="yt2bili-smoke-") as folder:
     command = [str(Path(args.frozen).resolve())] if args.frozen else [sys.executable, "-u", "-m", "yt2bili.desktop_worker"]
-    command += ["--data-dir", folder, "--resources", str(root)]
+    command += ["--data-dir", folder, "--resources", str(args.resources.resolve() if args.resources else root)]
     environment = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", ""), "PYTHONIOENCODING": "utf-8"}
     methods = ["system.health", "settings.get", "tasks.list", "system.diagnostics"]
     requests = "".join(json.dumps({"protocol_version": 2, "request_id": str(i), "method": name, "params": {}}) + "\n"
@@ -28,6 +29,11 @@ with tempfile.TemporaryDirectory(prefix="yt2bili-smoke-") as folder:
     assert all("error" not in item for item in responses.values()), responses
     assert responses["0"]["result"]["protocol_version"] == 2
     assert not responses["2"]["result"]["items"]
+    if args.resources:
+        bundled = {item["name"]: item for item in responses["3"]["result"]["tools"]}
+        for name in ("ffmpeg", "ffprobe", "biliup", "node"):
+            assert bundled[name]["available"], bundled[name]
+            assert Path(bundled[name]["path"]).resolve().is_relative_to(args.resources.resolve()), bundled[name]
     print(json.dumps({"worker": "frozen" if args.frozen else "source", "protocol": "passed", "responses": len(responses)}))
     result = subprocess.run(command + ["--self-test"], cwd=folder, env=environment, text=True,
                             encoding="utf-8", capture_output=True, timeout=60)

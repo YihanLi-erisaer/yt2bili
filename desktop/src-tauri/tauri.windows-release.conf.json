@@ -1,0 +1,21 @@
+{
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "StarDazz",
+    "resources": {
+      "../../packaging/staging/yt2bili-worker/": "worker/",
+      "../../packaging/staging/windows-bin/": "bin/"
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "compression": "zlib",
+        "languages": ["SimpChinese", "TradChinese", "English"],
+        "displayLanguageSelector": true,
+        "startMenuFolder": "StarDazz"
+      }
+    }
+  }
+}

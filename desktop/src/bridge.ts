@@ -17,7 +17,7 @@ export async function request<T = any>(
       "请使用 npm run desktop 启动桌面应用。此页面尚未连接本地后台。",
     );
   const result = await invoke<T>("backend_request", { method, params });
-  if (import.meta.env.DEV && method === "system.health") {
+  if (method === "system.health") {
     await invoke("frontend_ready", { health: result });
   }
   return result;

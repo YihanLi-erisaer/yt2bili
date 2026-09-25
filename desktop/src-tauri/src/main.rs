@@ -105,8 +105,7 @@ async fn finish_close(app: tauri::AppHandle, worker: State<'_, Worker>) -> Resul
 
 #[tauri::command]
 fn frontend_ready(app: tauri::AppHandle, health: Value) {
-    // Only an isolated development smoke run sets this variable.
-    if cfg!(debug_assertions) {
+    if smoke_enabled() {
         if let Some(report) = std::env::var_os("YT2BILI_NATIVE_SMOKE_REPORT") {
             let value = json!({"ok":health["protocol_version"] == 2,"webview_loaded":true,
                 "frontend_ipc":true,"protocol_version":health["protocol_version"]});
@@ -114,6 +113,12 @@ fn frontend_ready(app: tauri::AppHandle, health: Value) {
             app.exit(0);
         }
     }
+}
+
+fn smoke_enabled() -> bool {
+    std::env::var_os("YT2BILI_NATIVE_SMOKE_REPORT").is_some()
+        && std::env::var_os("YT2BILI_DESKTOP_DATA").is_some()
+        && (cfg!(debug_assertions) || std::env::args().any(|arg| arg == "--smoke-test"))
 }
 
 #[cfg(windows)]
@@ -138,10 +143,16 @@ fn attach_job(child: &Child) -> Result<usize, String> {
 fn start_worker(app: &tauri::AppHandle) -> Result<Worker, Box<dyn std::error::Error>> {
     let project = std::env::var_os("YT2BILI_PROJECT_ROOT").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf());
-    let resources = std::env::var_os("YT2BILI_RESOURCES").map(PathBuf::from).unwrap_or_else(|| project.clone());
+    let resources = if cfg!(debug_assertions) {
+        std::env::var_os("YT2BILI_RESOURCES").map(PathBuf::from).unwrap_or_else(|| project.clone())
+    } else {
+        app.path().resource_dir()?
+    };
     let data = std::env::var_os("YT2BILI_DESKTOP_DATA").map(PathBuf::from)
         .unwrap_or(app.path().local_data_dir()?.join("StarDazz").join("yt2bili"));
-    let mut command = if let Some(frozen) = std::env::var_os("YT2BILI_WORKER") {
+    let mut command = if !cfg!(debug_assertions) {
+        Command::new(resources.join("worker").join(if cfg!(windows) { "yt2bili-worker.exe" } else { "yt2bili-worker" }))
+    } else if let Some(frozen) = std::env::var_os("YT2BILI_WORKER") {
         Command::new(frozen)
     } else {
         let python = std::env::var_os("YT2BILI_PYTHON").map(PathBuf::from).unwrap_or_else(|| {
@@ -151,8 +162,8 @@ fn start_worker(app: &tauri::AppHandle) -> Result<Worker, Box<dyn std::error::Er
         cmd.args(["-u", "-m", "yt2bili.desktop_worker"]);
         cmd
     };
-    command.arg("--data-dir").arg(data).arg("--resources").arg(resources)
-        .current_dir(&project).env("PYTHONIOENCODING", "utf-8")
+    command.arg("--data-dir").arg(data).arg("--resources").arg(&resources)
+        .current_dir(if cfg!(debug_assertions) { &project } else { &resources }).env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)] {
         use std::os::windows::process::CommandExt;
@@ -204,7 +215,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             app.manage(start_worker(app.handle())?);
-            if cfg!(debug_assertions) && std::env::var_os("YT2BILI_NATIVE_SMOKE_REPORT").is_some() {
+            if smoke_enabled() {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
             }
             Ok(())

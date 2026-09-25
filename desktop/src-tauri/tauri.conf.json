@@ -5,7 +5,7 @@
   "identifier": "com.stardazz.yt2bili",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "node scripts/build-frontend.mjs",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },
