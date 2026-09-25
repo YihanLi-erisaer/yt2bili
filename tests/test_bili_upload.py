@@ -1,11 +1,12 @@
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from yt2bili import bili_upload
+from yt2bili import bili_upload, events
 
 
 class UploadArgumentTests(unittest.TestCase):
@@ -18,7 +19,7 @@ class UploadArgumentTests(unittest.TestCase):
         except bili_upload.Yt2BiliError:
             self.skipTest("Local biliup executable is required for parser regression")
 
-        def parse_only(cmd):
+        def parse_only(cmd, **kwargs):
             # --help parses the real upload arguments and exits before login,
             # file reads or network activity. Never submit the test fixtures.
             result = subprocess.run(
@@ -48,6 +49,30 @@ class UploadArgumentTests(unittest.TestCase):
                     with self.subTest(title=title, description=description):
                         settings.bili_tags = tags
                         bili_upload.upload(settings, video, cover, title, description, "https://example.com")
+
+    def test_upload_monitor_reports_speed_each_second(self):
+        report = Mock()
+        stop = Mock()
+        stop.wait.side_effect = [False, False, True]
+        state = {}
+        with patch.object(bili_upload, "_process_read_bytes", side_effect=[100, 1100, 3100]), \
+             patch.object(bili_upload.time, "monotonic", side_effect=[0, 1, 2]):
+            bili_upload._monitor_upload(123, stop, report, state)
+        self.assertEqual([call.kwargs["speed"] for call in report.call_args_list], [1000, 2000])
+        self.assertEqual(state["speed"], 2000)
+
+    def test_captured_progress_keeps_identity_in_monitor_thread(self):
+        emitted = []
+        with events.task_context("video-id", None, lambda event, payload: emitted.append((event, payload)),
+                                 task_id="task-id", account_id="account-id", run_id="run-id"):
+            report = events.capture_progress("uploading")
+            thread = threading.Thread(target=lambda: report(speed=1024))
+            thread.start()
+            thread.join()
+        self.assertEqual(emitted[0][0], "task.progress")
+        self.assertEqual(emitted[0][1]["task_id"], "task-id")
+        self.assertEqual(emitted[0][1]["stage"], "uploading")
+        self.assertEqual(emitted[0][1]["speed"], 1024)
 
 
 if __name__ == "__main__":

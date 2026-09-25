@@ -68,7 +68,7 @@ test("empty workspace, preview default, and modal keyboard focus", async ({
   await expect(dialog.getByRole("radio").first()).toBeChecked();
   await expect(dialog.getByRole("button", { name: "加入队列" })).toBeDisabled();
   await dialog.getByRole("textbox").fill("https://youtu.be/abcdefghijk");
-  await dialog.getByRole("checkbox").check();
+  await dialog.getByRole("checkbox", { name: /我拥有该视频的版权/ }).check();
   await expect(dialog.getByRole("button", { name: "加入队列" })).toBeDisabled();
   await dialog.getByLabel("目标 Bilibili 账号").selectOption("account-5");
   await dialog.getByRole("button", { name: "加入队列" }).click();
@@ -116,12 +116,12 @@ test("production-style unconnected page never pretends to perform work", async (
   await expect(page.getByText("未连接到后台")).toBeVisible();
   await expect(page.getByRole("button", { name: /新建任务/ })).toBeDisabled();
 });
-test("five accounts have seven lanes and account capacity is enforced", async ({
+test("five accounts plus Douyin and three shared stages have nine lanes", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 1024, height: 680 });
   await page.goto("/?preview&accounts=5");
-  await expect(page.locator(".queue-card")).toHaveCount(7);
+  await expect(page.locator(".queue-card")).toHaveCount(9);
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth > innerWidth,

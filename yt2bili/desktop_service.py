@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 from PIL import Image
 
-from yt2bili import bili_upload, youtube, translate
+from yt2bili import bili_upload, youtube, translate, publications
 from yt2bili.db import Task, TaskStore
 from yt2bili.desktop_auth import LoginSession, account_status, validate_login
 from yt2bili.desktop_settings import DesktopSettings, atomic_json
@@ -51,7 +51,9 @@ class DesktopService:
         try:
             self.store = TaskStore(paths.root / "data/tasks.sqlite", self.emit)
             self.accounts = AccountService(paths.root, self.store, self.emit)
-            self.scheduler = Scheduler(self.store, self.config, self.emit, self.accounts)
+            from yt2bili.douyin import DouyinService
+            self.douyin = DouyinService(self.store, self.config, self.emit)
+            self.scheduler = Scheduler(self.store, self.config, self.emit, self.accounts, self.douyin)
         except BaseException:
             self.owner_lock.__exit__(None, None, None)
             raise
@@ -84,6 +86,14 @@ class DesktopService:
                 self.auth_state.pop("qrcode", None)
         if event == "accounts.changed" and hasattr(self, "scheduler"):
             self.scheduler.sync_accounts(payload.get("account_id"))
+        if event == "douyin.auth.changed" and hasattr(self, "scheduler"):
+            self.scheduler.douyin_lane.wake(credentials=True)
+        if event == "douyin.queue.resume" and hasattr(self, "scheduler"):
+            lane = self.scheduler.douyin_lane
+            with lane.condition:
+                for item in lane.items:
+                    if item.wait_reason == "rate_limited": item.wait_reason, item.deadline = "", None
+                lane.condition.notify_all()
         self.output(event, payload)
 
     def add_log(self, entry):
@@ -131,6 +141,14 @@ class DesktopService:
             "accounts.archive": self.archive_account, "accounts.resume_uploads": self.resume_uploads,
             "accounts.verify": self.accounts.verify,
             "tasks.bind_legacy_account": self.bind_legacy,
+            "douyin.auth.status": self.douyin.status, "douyin.auth.start": self.douyin.start,
+            "douyin.auth.configure": self.configure_douyin,
+            "douyin.auth.cancel": lambda: self.douyin.request("POST", "/v1/auth/cancel"),
+            "douyin.auth.clear": self.douyin.clear, "douyin.accounts.archive": self.douyin.archive,
+            "douyin.accounts.resume_uploads": self.douyin.resume,
+            "publications.update_metadata": self.update_publication,
+            "publications.retry": self.retry_publication, "publications.abandon": self.abandon_publication,
+            "publications.resolve": self.resolve_publication, "publications.cancel": self.cancel_publication,
             "system.prepare_shutdown": self.prepare_shutdown,
             "system.shutdown_status": self.shutdown_status,
             "logs.tail": self.log_tail, "logs.export": self.log_export,
@@ -141,8 +159,8 @@ class DesktopService:
         return handler(**params)
 
     def health(self):
-        return {"protocol_version": 2, "schema_version": 3, "account_limit": 5,
-                "capabilities": ["single_url", "account_lanes", "graceful_shutdown", "local_translation_v1"],
+        return {"protocol_version": 2, "schema_version": 4, "account_limit": 5,
+                "capabilities": ["single_url", "account_lanes", "graceful_shutdown", "local_translation_v1", "douyin_sync_v1"],
                 "migration_notes": self.migration_notes, "version": "0.2.0-alpha.1", "queue": self.scheduler.snapshot(),
                 "data_dir": str(self.paths.root)}
 
@@ -214,8 +232,11 @@ class DesktopService:
         return {"tools": tools, "free_bytes": shutil.disk_usage(work).free, "work_dir": str(work)}
 
     def update_settings(self, values):
+        if not isinstance(values, dict): raise Yt2BiliError("设置参数必须为对象。")
         with self.mutation:
             self.ensure_idle()
+            if values.get("douyin_broker_url", self.config.values["douyin_broker_url"]) != self.config.values["douyin_broker_url"] and self.douyin.account():
+                raise Yt2BiliError("更换抖音授权服务前须先归档抖音账号。")
             result = self.config.update(values)
             self.apply_environment()
             return result
@@ -258,13 +279,18 @@ class DesktopService:
             self.scheduler.signal.set()
             return result
 
-    def create(self, url, operation_id, account_id=None, mode="preview"):
+    def create(self, url, operation_id, account_id=None, mode="preview", sync_douyin=False, douyin_account_id=None, douyin_binding_revision=None):
+        if type(sync_douyin) is not bool: raise Yt2BiliError("同步抖音必须为开关值。")
+        dy_account = None
         video_id, canonical = parse_single_video_url(url)
         if mode not in ("preview", "auto"):
             raise Yt2BiliError("任务模式无效。")
         if not account_id or not isinstance(account_id, str):
             raise Yt2BiliError("请选择本次投稿的 Bilibili 账号。")
         def preflight():
+            nonlocal dy_account
+            if sync_douyin:
+                dy_account = self.douyin.check(douyin_account_id, douyin_binding_revision, auto=mode == "auto")
             account = self.store.account(account_id)
             if self.translation_jobs.active():
                 raise Yt2BiliError("请等待翻译组件操作结束后创建任务。")
@@ -278,10 +304,21 @@ class DesktopService:
             task = Task(video_id, canonical, "pending", task_id=str(uuid.uuid4()), account_id=account_id,
                         account_uid_snapshot=account["uid"], account_name_snapshot=account["nickname"] or account["uid"])
             self.store.upsert(task)
+            publications.ensure_bili(self.store, task)
+            if sync_douyin:
+                account_now = self.douyin.account()
+                if not account_now or account_now != dy_account:
+                    raise Yt2BiliError("抖音账号状态已变化，请重试。")
+                duplicate = self.store._conn.execute("SELECT task_id FROM task_publications WHERE platform='douyin' AND account_id=? AND source_video_id=?", (dy_account["account_id"], video_id)).fetchone()
+                if duplicate: raise Yt2BiliError("此抖音账号已有同视频任务：" + duplicate[0] + "；请取消同步或继续原任务。")
+                self.store._conn.execute("INSERT INTO task_publications(publication_id,task_id,platform,account_id,source_video_id) VALUES(?,?,'douyin',?,?)", (str(uuid.uuid4()), task.task_id, dy_account["account_id"], video_id))
+                dy = publications.for_platform(self.store, task.task_id, "douyin")
+                publications.change(self.store, dy["publication_id"], snapshot=json.dumps({k: dy_account[k] for k in ("client_key", "open_id", "nickname", "binding_revision")}))
             self.scheduler.add(task, mode)
             return {"task_id": task.task_id, "account_id": account_id, "created": True, "status": task.status}
-        return self.operation(operation_id, "tasks.create", action,
-                              {"url": canonical, "account_id": account_id, "mode": mode}, preflight)
+        params = {"url": canonical, "account_id": account_id, "mode": mode}
+        if sync_douyin: params.update(sync_douyin=True, douyin_account_id=douyin_account_id, douyin_binding_revision=douyin_binding_revision)
+        return self.operation(operation_id, "tasks.create", action, params, preflight)
 
     def bind_legacy(self, task_id, account_id):
         with self.mutation, self.store.transaction():
@@ -295,6 +332,7 @@ class DesktopService:
             task.account_id, task.account_uid_snapshot = account_id, account["uid"]
             task.account_name_snapshot = account["nickname"] or account["uid"]
             self.store.upsert(task)
+            self.store._conn.execute("UPDATE task_publications SET account_id=? WHERE task_id=? AND platform='bilibili' AND account_id IS NULL", (account_id, task.task_id))
             return asdict(task)
 
     def list_tasks(self, offset=0, limit=100, search="", status="", history=False, account_id=""):
@@ -303,9 +341,10 @@ class DesktopService:
         tasks = self.store.list_all()
         tasks = [item for item in tasks if (not search or search.lower() in (item.title_zh + item.title_orig + item.video_id).lower())
                  and (not account_id or item.account_id == account_id) and (not status or item.status == status)
-                 and (not history or item.status in ("submitted", "submission_unknown"))]
+                 and (not history or item.status in ("submitted", "submission_unknown", "partial_success", "completed_with_abandon"))]
         all_tasks = self.store.list_all()
         return {"items": [{**{key: value for key, value in asdict(item).items() if key not in ("desc_orig", "desc_zh")},
+                           "publications": publications.items(self.store, item.task_id),
                            "run_id": (self.store.get_job(item.task_id) or {}).get("run_id")} for item in tasks[offset:offset + limit]], "total": len(tasks),
                 "counts": {name: sum(t.status == name for t in all_tasks) for name in ("downloading", "validating", "uploading", "ready", "submitted", "failed")},
                 "queue": self.scheduler.snapshot(), "all_total": len(all_tasks)}
@@ -313,6 +352,7 @@ class DesktopService:
     def get_task(self, task_id):
         task = self.task(task_id)
         result = asdict(task)
+        result["publications"] = publications.items(self.store, task_id)
         result["translation"] = self.store.translation(task_id)
         result["snapshot"] = self.store.get_job(task_id)
         result["run_id"] = (result["snapshot"] or {}).get("run_id")
@@ -322,6 +362,8 @@ class DesktopService:
     def retry(self, task_id, operation_id, use_current_translation_settings=False):
         def action():
             task = self.task(task_id)
+            if any(p["status"] in publications.TERMINAL | {"submission_unknown"} for p in publications.items(self.store, task_id)):
+                raise Yt2BiliError("请在平台投稿记录中单独继续未完成目标。")
             if task.status not in ("failed", "cancelled", "interrupted"):
                 raise Yt2BiliError("只有失败、取消或中断的任务可以继续；待核对投稿需先核对结果。")
             snapshot = self.store.get_job(task_id) or {}
@@ -336,16 +378,96 @@ class DesktopService:
             return {"queued": True}
         return self.operation(operation_id, "tasks.retry", action, {"task_id": task_id, "use_current_translation_settings": use_current_translation_settings})
 
-    def submit(self, task_id, operation_id):
+    def submit(self, task_id, operation_id, targets=None, revisions=None):
+        if targets is not None and (not isinstance(targets, list) or not targets or len(targets) > 2 or any(not isinstance(v, str) for v in targets) or len(set(targets)) != len(targets)):
+            raise Yt2BiliError("投稿目标列表无效。")
+        if revisions is not None and not isinstance(revisions, dict): raise Yt2BiliError("投稿版本快照无效。")
         def action():
             task = self.task(task_id)
-            if task.status != "ready":
+            self.ensure_inactive(task_id)
+            if task.status not in ("ready", "partial_success"):
                 raise Yt2BiliError("只有已准备好素材的任务可以确认投稿。")
-            self.store.account(task.account_id)
             saved = self.store.get_job(task_id) or {}
-            self.scheduler.add(task, "submit", saved.get("settings"), stage="validate")
+            pubs = publications.items(self.store, task_id)
+            if targets is not None and set(targets) - {p["publication_id"] for p in pubs}: raise Yt2BiliError("投稿目标不属于此任务。")
+            selected = [p for p in pubs if targets is None and p["status"] == "ready" or targets is not None and p["publication_id"] in targets]
+            self.store.account(task.account_id, active=any(p["platform"] == "bilibili" for p in selected))
+            if not selected or any(p["status"] != "ready" for p in selected): raise Yt2BiliError("投稿目标尚未准备好。")
+            if revisions is not None and any(revisions.get(p["publication_id"]) != p["revision"] for p in selected): raise Yt2BiliError("文案已变化，请刷新预览后确认。")
+            publications.freeze(self.store, task_id, [p["publication_id"] for p in selected])
+            self.scheduler.add(task, "submit", saved.get("settings"), stage="validate", targets=[p["publication_id"] for p in selected])
             return {"queued": True}
-        return self.operation(operation_id, "tasks.submit", action, {"task_id": task_id})
+        params = {"task_id": task_id}
+        if targets is not None: params.update(targets=targets, revisions=revisions)
+        return self.operation(operation_id, "tasks.submit", action, params)
+
+    def configure_douyin(self, url, pairing_key):
+        with self.mutation:
+            self.ensure_idle()
+            return self.douyin.configure(url, pairing_key)
+
+    def update_publication(self, publication_id, text, revision):
+        with self.mutation, self.store.transaction():
+            p = publications.get(self.store, publication_id)
+            self.ensure_inactive(p["task_id"])
+            if p["platform"] != "douyin" or p["status"] != "ready" or p["revision"] != revision:
+                raise Yt2BiliError("只能编辑预览中的抖音文案，请刷新后重试。")
+            if not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000: raise Yt2BiliError("抖音文案须为 1～1000 字。")
+            publications.change(self.store, publication_id, text=text.strip())
+            return publications.get(self.store, publication_id)
+
+    def retry_publication(self, publication_id, operation_id):
+        def action():
+            p = publications.get(self.store, publication_id)
+            self.ensure_inactive(p["task_id"])
+            if p["status"] not in ("failed", "cancelled", "interrupted", "blocked_validation"):
+                raise Yt2BiliError("只能继续已失败、取消或中断的目标；结果待核对时禁止重投。")
+            task = self.task(p["task_id"])
+            if not task.video_path or not Path(task.video_path).is_file(): raise Yt2BiliError("本地素材缺失，请先恢复素材；不会自动重发已成功目标。")
+            publications.change(self.store, publication_id, status="ready", error="")
+            publications.project(self.store, task.task_id)
+            return {"ready": True}
+        return self.operation(operation_id, "publications.retry", action, {"publication_id": publication_id})
+
+    def cancel_publication(self, publication_id):
+        with self.mutation, self.scheduler.guard:
+            p = publications.get(self.store, publication_id)
+            if p["status"] in publications.INFLIGHT | publications.TERMINAL | {"submission_unknown"}:
+                raise Yt2BiliError("此目标不能取消，请等待或核对结果。")
+            root = self.scheduler.active.get(p["task_id"])
+            if root:
+                child = root.children.get(p["platform"])
+                if not child: raise Yt2BiliError("共享素材准备阶段请取消整个任务。")
+                child.cancel.set()
+            publications.change(self.store, publication_id, status="cancelled", error="用户取消，素材保留。")
+            publications.project(self.store, p["task_id"])
+            return {"cancelled": True}
+
+    def abandon_publication(self, publication_id):
+        with self.mutation, self.store.transaction():
+            p = publications.get(self.store, publication_id)
+            self.ensure_inactive(p["task_id"])
+            if p["status"] in publications.INFLIGHT | {"submitted", "submission_unknown"}: raise Yt2BiliError("请先核对投稿结果；已提交目标不能放弃。")
+            publications.change(self.store, publication_id, status="abandoned", error="用户明确放弃该目标。")
+            publications.project(self.store, p["task_id"])
+        with work_lock(Path(self.task(p["task_id"]).work_dir)):
+            self.scheduler.uploader.cleanup(p["task_id"])
+        return {"abandoned": True}
+
+    def resolve_publication(self, publication_id, remote_id="", not_submitted=False):
+        if type(not_submitted) is not bool: raise Yt2BiliError("核对结果必须为明确的开关值。")
+        with self.mutation, self.store.transaction():
+            p = publications.get(self.store, publication_id)
+            self.ensure_inactive(p["task_id"])
+            if p["status"] != "submission_unknown": raise Yt2BiliError("此目标无需核对。")
+            if not_submitted is not True and (not isinstance(remote_id, str) or not remote_id.strip() or len(remote_id) > 512): raise Yt2BiliError("请填写已核对的作品 ID。")
+            if p["platform"] == "bilibili" and not not_submitted and not re.fullmatch(r"BV[0-9A-Za-z]{10}", remote_id): raise Yt2BiliError("BV 号格式无效。")
+            if p["platform"] == "douyin":
+                self.douyin.request("POST", "/v1/publications/" + publication_id + "/resolve", {"not_submitted": not_submitted, "remote_id": remote_id})
+            publications.change(self.store, publication_id, status="interrupted" if not_submitted else "submitted", remote_id="" if not_submitted else remote_id, retain_assets=1, error="用户核对结果；保留本地素材。")
+            if p["platform"] == "bilibili" and not not_submitted: self.store.update(p["task_id"], bv_id=remote_id)
+            publications.project(self.store, p["task_id"])
+            return self.get_task(p["task_id"])
 
     def cancel(self, task_id):
         self.task(task_id)
@@ -379,6 +501,8 @@ class DesktopService:
             record = self.store.translation(task_id) or {}
             record.update(state="edited", user_edited=True, description=body)
             self.store.save_translation(task, record)
+            p = publications.for_platform(self.store, task.task_id, "bilibili")
+            if p: publications.change(self.store, p["publication_id"], text=task.title_zh)
             for name, content in (("title.txt", task.title_zh), ("desc.txt", task.desc_zh)):
                 (Path(task.work_dir) / name).write_text(content, encoding="utf-8")
             return asdict(task)
@@ -386,6 +510,7 @@ class DesktopService:
     def resolve(self, task_id, bv_id="", not_submitted=False):
         with self.mutation:
             task = self.task(task_id)
+            if publications.dual(self.store, task_id): raise Yt2BiliError("请在对应平台记录中分别核对结果。")
             self.ensure_inactive(task_id)
             if task.status != "submission_unknown":
                 raise Yt2BiliError("此任务无需核对投稿结果。")
@@ -397,6 +522,8 @@ class DesktopService:
                     raise Yt2BiliError("请填写核对后的完整 BV 号。")
                 task.status, task.bv_id, task.error = "submitted", bv_id, "用户登记 BV 号；本地素材保留。"
             self.store.upsert(task)
+            p = publications.for_platform(self.store, task.task_id, "bilibili")
+            if p: publications.change(self.store, p["publication_id"], status=task.status, remote_id=task.bv_id, retain_assets=1)
             return asdict(task)
 
     def cover(self, task_id):
@@ -555,11 +682,13 @@ class DesktopService:
                 raise Yt2BiliError("请选择另一个有效项目的数据目录。")
             with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as old:
                 version = old.execute("PRAGMA user_version").fetchone()[0]
-                if version > 3:
+                if version > 4:
                     raise Yt2BiliError("不支持的来源数据库版本。")
                 old.row_factory = sqlite3.Row
                 rows = [dict(r) for r in old.execute("SELECT * FROM tasks")]
                 tables = {r[0] for r in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if "task_publications" in tables and old.execute("SELECT 1 FROM task_publications WHERE platform='douyin'").fetchone():
+                    raise Yt2BiliError("包含抖音投稿的数据须整体备份/恢复，不能以旧版导入方式重建投稿身份；源数据未修改。")
                 records = {r[0]: json.loads(r[1]) for r in old.execute("SELECT * FROM task_translation")} if "task_translation" in tables else {}
                 attempts = [dict(r) for r in old.execute("SELECT * FROM translation_attempts ORDER BY id")] if "translation_attempts" in tables else []
             source_id = hashlib.sha256(str(db).encode()).hexdigest()
@@ -609,6 +738,7 @@ class DesktopService:
                     elif task.status not in ("submitted", "ready", "failed", "cancelled", "submission_unknown"):
                         task.status = "interrupted"
                     self.store.upsert(task)
+                    publications.ensure_bili(self.store, task)
                     from yt2bili.translation.config import legacy_snapshot
                     record = records.get(legacy_id) or {"config_snapshot": legacy_snapshot({})}
                     if task.title_zh and not record.get("state"):

@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from yt2bili import events, media, pipeline
+from yt2bili import events, media, pipeline, publications
 from yt2bili.db import Task
 from yt2bili.exceptions import InvalidMediaError, Yt2BiliError
 from yt2bili.locking import work_lock
@@ -35,6 +35,8 @@ class ScheduledJob:
     sequence: int = 0
     running: bool = False
     running_action: str = ""
+    platform: str = ""
+    children: dict = field(default_factory=dict)
 
     @property
     def mode(self): return self.payload["mode"]
@@ -44,8 +46,9 @@ class ScheduledJob:
 
 
 class AccountLane:
-    def __init__(self, scheduler, account_id):
+    def __init__(self, scheduler, account_id, platform="bilibili"):
         self.scheduler, self.account_id = scheduler, account_id
+        self.platform = platform
         self.condition = threading.Condition()
         self.items = []
         self.stopped = False
@@ -62,6 +65,7 @@ class AccountLane:
         with self.condition:
             if credentials:
                 for item in self.items:
+                    if self.platform == "douyin" and item.wait_reason == "rate_limited": continue
                     item.deadline, item.wait_reason = 0, ""
             self.condition.notify_all()
 
@@ -78,9 +82,6 @@ class AccountLane:
                 if head and head.assets_complete and (not head.wait_reason or
                         head.deadline is not None and time.monotonic() >= head.deadline):
                     item, action = head, "submit"
-                else:
-                    item = next((i for i in items if not i.assets_complete), None)
-                    action = "prepare"
             if item is None:
                 with self.condition:
                     self.condition.wait(.25)
@@ -89,34 +90,29 @@ class AccountLane:
             try:
                 item.running = True
                 item.running_action = action
+                if self.scheduler.closing: item.cancel.set()
                 with self.scheduler.context(item):
                     events.check_cancelled()
-                    if action == "prepare":
-                        task = self.scheduler.store.require(item.task_id)
-                        item.job.task = task
-                        with pipeline._job_context(item.job):
-                            if item.mode == "retranslate":
-                                from yt2bili.translation.tasks import prepare
-                                self.scheduler.store.update(item.task_id, status="translating")
-                                prepare(item.settings, self.scheduler.store, task, item.job.meta, item.job.work_dir, force=True)
-                            else:
-                                pipeline._prepare_assets(item.settings, self.scheduler.store, task,
-                                    item.job.meta, item.job.work_dir, Path(task.video_path))
-                        events.check_cancelled()
-                        item.assets_complete = True
-                        if item.mode in ("preview", "retranslate"):
-                            self.scheduler.store.update(item.task_id, status="ready", wait_reason="")
-                            finished = True
-                        else:
-                            self.scheduler.store.update(item.task_id, status="queued_upload", wait_reason="queue")
+                    if self.platform == "douyin":
+                        from yt2bili.douyin import AuthRequired, RateLimited
+                        try:
+                            self.scheduler.douyin.publish(item)
+                            reason, deadline = "finished", None
+                        except AuthRequired:
+                            with self.scheduler.store.transaction() as db:
+                                db.execute("UPDATE douyin_accounts SET auth_state='expired' WHERE lifecycle='active'")
+                            reason, deadline = "auth_required", None
+                        except RateLimited:
+                            reason, deadline = "rate_limited", None
                     else:
                         reason, deadline = self.scheduler.uploader.try_submit(item)
-                        finished = reason == "finished"
-                        if not finished:
-                            item.wait_reason, item.deadline = reason, deadline
-                            current = self.scheduler.store.require(item.task_id)
-                            if current.wait_reason != reason:
-                                self.scheduler.store.update(item.task_id, status="queued_upload", wait_reason=reason)
+                    finished = reason == "finished"
+                    if not finished:
+                        item.wait_reason, item.deadline = reason, deadline
+                        p = publications.for_platform(self.scheduler.store, item.task_id, self.platform)
+                        if p: publications.change(self.scheduler.store, p["publication_id"], status="waiting", error=reason)
+                        self.scheduler.store.update(item.task_id, wait_reason=reason)
+                        publications.project(self.scheduler.store, item.task_id)
                     self.scheduler.persist(item)
             except Exception as exc:
                 finished = True
@@ -131,8 +127,9 @@ class AccountLane:
 
 
 class Scheduler:
-    def __init__(self, store, config, emit, accounts):
+    def __init__(self, store, config, emit, accounts, douyin=None):
         self.store, self.config, self.emit, self.accounts = store, config, emit, accounts
+        self.douyin = douyin
         self.guard = threading.RLock()
         self.active, self.upload_lanes = {}, {}
         self.closing = False
@@ -140,12 +137,13 @@ class Scheduler:
         self.signal = threading.Event()
         self.session_id = str(uuid.uuid4())
         self.queue_revision = 0
-        self.queues = {name: queue.Queue() for name in ("download", "validate")}
+        self.queues = {name: queue.Queue() for name in ("download", "validate", "prepare")}
         self.uploader = UploadCoordinator(store, accounts)
         self._recover()
         self.sync_accounts()
+        self.douyin_lane = AccountLane(self, "douyin", "douyin")
         self.threads = [threading.Thread(target=self._work, args=(stage,), name=f"desktop-{stage}", daemon=True)
-                        for stage in self.queues]
+                        for stage in ["download", "validate"] + ["prepare"] * 5]
         for thread in self.threads:
             thread.start()
         self.dispatcher = threading.Thread(target=self._dispatch, name="desktop-dispatch", daemon=True)
@@ -153,6 +151,18 @@ class Scheduler:
 
     def _recover(self):
         for task in self.store.list_all():
+            if publications.dual(self.store, task.task_id):
+                for p in publications.items(self.store, task.task_id):
+                    if p["status"] in ("creating", "submission_unknown") or p["platform"] == "bilibili" and p["status"] == "uploading_media":
+                        publications.change(self.store, p["publication_id"], status="submission_unknown", error="上次投稿结果待核对，不会自动重投。")
+                    elif p["status"] not in publications.TERMINAL | {"ready", "failed", "cancelled", "interrupted", "blocked_validation"}:
+                        publications.change(self.store, p["publication_id"], status="interrupted", error="上次运行中断，请手动继续。")
+                publications.project(self.store, task.task_id)
+                saved = self.store.get_job(task.task_id)
+                if saved:
+                    saved["execution_state"] = "interrupted"
+                    self.store.save_job(task.task_id, saved)
+                continue
             saved = self.store.get_job(task.task_id) or {}
             if task.status in ("uploading", "submission_unknown") or task.status == "submitted" and not task.bv_id:
                 self.store.update(task.task_id, status="submission_unknown", error="请核对该账号创作中心；不会自动重复投稿。")
@@ -181,13 +191,16 @@ class Scheduler:
                 lane.wake(credentials=key == changed_account)
 
     def context(self, item):
+        p = publications.for_platform(self.store, item.task_id, item.platform) if item.platform else None
         return events.task_context(item.video_id, item.cancel, self.emit, task_id=item.task_id,
-                                   account_id=item.job.task.account_id, run_id=item.run_id)
+                                   account_id=p["account_id"] if p else item.job.task.account_id, run_id=item.run_id,
+                                   platform=item.platform or None, publication_id=p["publication_id"] if p else None)
 
-    def add(self, task: Task, mode="preview", snapshot=None, stage="download", repair=False):
+    def add(self, task: Task, mode="preview", snapshot=None, stage="download", repair=False, targets=None):
         if self.closing:
             raise Yt2BiliError("应用正在退出，不能添加任务。")
-        self.store.account(task.account_id, active=not repair)
+        needs_bili = targets is None or any(p["platform"] == "bilibili" and p["publication_id"] in targets for p in publications.items(self.store, task.task_id))
+        self.store.account(task.account_id, active=not repair and needs_bili)
         with self.store.transaction():
             saved = self.store.get_job(task.task_id) or {}
             if saved.get("owner_session_id") == self.session_id and saved.get("execution_state") in ("queued", "running", "waiting"):
@@ -206,7 +219,7 @@ class Scheduler:
             self.store.save_job(task.task_id, dict(mode="repair" if repair else mode, settings=values,
                 original_status=original, stage=stage, execution_state="queued",
                 run_id=str(uuid.uuid4()), owner_session_id=self.session_id, sequence=self.store.next_sequence(),
-                media_attempts=0, assets_complete=mode == "submit"))
+                media_attempts=0, assets_complete=mode == "submit", targets=targets))
         self.signal.set()
 
     def _dispatch(self):
@@ -255,11 +268,17 @@ class Scheduler:
 
     def _put(self, item):
         if item.stage == "upload":
-            self.upload_lanes[item.job.task.account_id].put(item)
+            if item.assets_complete:
+                self.fanout(item)
+            else:
+                item.stage = "prepare"
+                self.queues["prepare"].put(item)
         else:
             self.queues[item.stage].put(item)
 
     def persist(self, item, finished=False):
+        if item.platform:
+            return
         item.payload.update(stage=item.stage, execution_state="finished" if finished else "running",
                             media_attempts=item.job.attempts, assets_complete=item.assets_complete, sequence=item.sequence)
         self.store.save_job(item.task_id, item.payload)
@@ -272,8 +291,26 @@ class Scheduler:
         self._put(item)
 
     def cancel(self, identity):
+        task_id = self.store.require(identity).task_id
+        with self.guard:
+            root = self.active.get(task_id)
+            if root and root.children and publications.dual(self.store, task_id):
+                cancelled = False
+                with self.store.transaction():
+                    for child in root.children.values():
+                        p = publications.for_platform(self.store, task_id, child.platform)
+                        if p["status"] not in publications.INFLIGHT | publications.TERMINAL | {"submission_unknown"}:
+                            child.cancel.set()
+                            publications.change(self.store, p["publication_id"], status="cancelled", error="用户取消，素材保留。")
+                            cancelled = True
+                    publications.project(self.store, task_id)
+                if not cancelled: raise Yt2BiliError("所有剩余目标均已在途或待核对，请等待并核对结果。")
+                for lane in [*self.upload_lanes.values(), self.douyin_lane]: lane.wake()
+                return
         with self.store.transaction():
             task = self.store.require(identity)
+            if any(p["status"] in publications.INFLIGHT for p in publications.items(self.store, task.task_id)):
+                raise Yt2BiliError("正在投稿，请等待结果；可单独取消尚未上传的目标。")
             if task.status == "uploading":
                 raise Yt2BiliError("正在提交，请等待上传结束并核对结果。")
             saved = self.store.get_job(task.task_id) or {}
@@ -284,12 +321,18 @@ class Scheduler:
             item = self.active.get(task.task_id)
             if item:
                 item.cancel.set()
+                for child in item.children.values(): child.cancel.set()
             else:
                 self.store.update(task.task_id, status="cancelled", wait_reason="")
+                for p in publications.items(self.store, task.task_id):
+                    if p["status"] not in publications.TERMINAL | {"submission_unknown"}:
+                        publications.change(self.store, p["publication_id"], status="cancelled", error="用户取消，素材保留。")
+                publications.project(self.store, task.task_id)
                 saved["execution_state"] = "finished"
                 self.store.save_job(task.task_id, saved)
             for lane in self.upload_lanes.values():
                 lane.wake()
+            self.douyin_lane.wake()
         self.signal.set()
 
     def _work(self, stage):
@@ -308,6 +351,29 @@ class Scheduler:
                         media.require_ffmpeg()
                         pipeline._download_job(item.settings, self.store, item.job, False, set())
                         self.route(item, "validate")
+                    elif stage == "prepare":
+                        events.check_cancelled()
+                        task = self.store.require(item.task_id)
+                        item.job.task = task
+                        with pipeline._job_context(item.job):
+                            if item.mode == "retranslate":
+                                from yt2bili.translation.tasks import prepare
+                                prepare(item.settings, self.store, task, item.job.meta, item.job.work_dir, force=True)
+                            else:
+                                pipeline._prepare_assets(item.settings, self.store, task, item.job.meta, item.job.work_dir, Path(task.video_path))
+                        events.check_cancelled()
+                        item.assets_complete = True
+                        publications.prepare(self.store, item.task_id)
+                        dy = publications.for_platform(self.store, item.task_id, "douyin")
+                        if dy and dy["status"] == "ready":
+                            try: self.douyin.validate_assets(item, dy["text"])
+                            except Yt2BiliError as exc:
+                                publications.change(self.store, dy["publication_id"], status="blocked_validation", error=str(exc))
+                        if item.mode in ("preview", "retranslate"):
+                            self.store.update(item.task_id, status="ready", wait_reason="")
+                            finished = True
+                        else:
+                            self.route(item, "upload")
                     else:
                         pipeline._validate_job(item.settings, self.store, item.job)
                         events.check_cancelled()
@@ -337,17 +403,39 @@ class Scheduler:
                 self.queues[stage].task_done()
 
     def fail(self, item, exc):
+        if item.platform:
+            p = publications.for_platform(self.store, item.task_id, item.platform)
+            if p["status"] not in publications.TERMINAL | {"submission_unknown"}:
+                state = "submission_unknown" if p["status"] == "creating" else "cancelled" if item.cancel.is_set() else "failed"
+                publications.change(self.store, p["publication_id"], status=state, error=str(exc))
+            publications.project(self.store, item.task_id)
+            return
         current = self.store.require(item.task_id)
         status = item.payload["original_status"] if item.mode in ("repair", "retranslate") else (
             current.status if current.status in ("submitted", "submission_unknown") else
             "submission_unknown" if current.status == "uploading" else
             "cancelled" if item.cancel.is_set() else "failed")
         self.store.update(item.task_id, status=status, error=str(exc), wait_reason="")
+        if item.mode not in ("repair", "retranslate"):
+            for p in publications.items(self.store, item.task_id):
+                if p["status"] not in publications.TERMINAL | {"submission_unknown"}:
+                    publications.change(self.store, p["publication_id"], status=status, error=str(exc))
         with events.task_context(item.video_id, None, self.emit, task_id=item.task_id,
                                  account_id=item.job.task.account_id, run_id=item.run_id):
             logging.getLogger(__name__).warning("[%s] %s", item.task_id, exc)
 
     def finish(self, item):
+        if item.platform:
+            with self.guard:
+                parent = self.active[item.task_id]
+                parent.children.pop(item.platform, None)
+                publications.project(self.store, item.task_id)
+                if parent.children: return
+                item = parent
+                try:
+                    if publications.can_cleanup(self.store, item.task_id): self.uploader.cleanup(item.task_id)
+                except OSError:
+                    self.store.update(item.task_id, cleanup_state="failed")
         self.persist(item, finished=True)
         with self.guard:
             current = self.store.require(item.task_id)
@@ -356,6 +444,23 @@ class Scheduler:
             self.active.pop(item.task_id, None)
             item.lock.__exit__(None, None, None)
         self.emit("queue.changed", self.snapshot())
+
+    def fanout(self, item):
+        publications.ensure_bili(self.store, self.store.require(item.task_id))
+        if item.mode != "submit": publications.freeze(self.store, item.task_id, item.payload.get("targets"))
+        pubs = [p for p in publications.items(self.store, item.task_id) if p["status"] == "queued"]
+        if not pubs:
+            publications.project(self.store, item.task_id)
+            self.finish(item)
+            return
+        # Parent owns the work lock; independent children never release it.
+        with self.guard:
+            for p in pubs:
+                child = replace(item, platform=p["platform"], cancel=threading.Event(), lock=None,
+                                children={}, payload=dict(item.payload), stage="upload", wait_reason="", deadline=None)
+                item.children[p["platform"]] = child
+            for child in list(item.children.values()):
+                (self.douyin_lane if child.platform == "douyin" else self.upload_lanes[item.job.task.account_id]).put(child)
 
     def snapshot(self):
         with self.guard:
@@ -374,17 +479,25 @@ class Scheduler:
                         "queued_count": sum(i["stage"] == stage and not any(j.task_id == i["task_id"] and j.running for j in selected) for i in active)}
             uploads = []
             for account_id, lane in self.upload_lanes.items():
-                selected = [i for i in items if i.stage == "upload" and i.job.task.account_id == account_id]
+                selected = list(lane.items)
                 current = next((i for i in selected if i.running), None)
                 waiting = next((i for i in selected if i.wait_reason), None)
                 uploads.append({"account_id": account_id, "running_task_id": current.task_id if current else None,
                     "running_action": current.running_action if current else None,
                     "queued_count": sum(not i.running for i in selected), "wait_reason": waiting.wait_reason if waiting else "",
                     "remaining_seconds": max(0, waiting.deadline-time.monotonic()) if waiting and waiting.deadline else None})
-            return {"queue_revision": self.queue_revision, "active": active, "download": shared("download"), "validate": shared("validate"), "uploads": uploads}
+            dy = list(self.douyin_lane.items)
+            return {"queue_revision": self.queue_revision, "active": active, "download": shared("download"), "validate": shared("validate"), "prepare": shared("prepare"), "uploads": uploads,
+                    "douyin": {"running_task_id": next((i.task_id for i in dy if i.running), None), "queued_count": sum(not i.running for i in dy), "wait_reason": next((i.wait_reason for i in dy if i.wait_reason), "")}}
 
     def prepare_shutdown(self):
         self.closing = True
+        with self.guard:
+            for root in self.active.values():
+                for child in root.children.values():
+                    p = publications.for_platform(self.store, child.task_id, child.platform)
+                    if p["status"] not in publications.INFLIGHT: child.cancel.set()
+            for lane in [*self.upload_lanes.values(), self.douyin_lane]: lane.wake()
         for task in self.store.list_all():
             saved = self.store.get_job(task.task_id) or {}
             if saved.get("owner_session_id") == self.session_id and saved.get("execution_state") in ("running", "queued", "waiting") and task.status != "uploading":
@@ -410,11 +523,11 @@ class Scheduler:
         self.closed.set()
         self.signal.set()
         self.dispatcher.join()
-        for queue_ in self.queues.values():
-            queue_.put(None)
+        for stage, queue_ in self.queues.items():
+            for _ in range(5 if stage == "prepare" else 1): queue_.put(None)
         for thread in self.threads:
             thread.join()
-        for lane in self.upload_lanes.values():
+        for lane in [*self.upload_lanes.values(), self.douyin_lane]:
             with lane.condition:
                 lane.stopped = True
                 lane.condition.notify_all()

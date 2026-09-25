@@ -149,6 +149,22 @@ export async function request(method: string, params: any): Promise<any> {
       configured: accounts.length > 0,
       login: { status: "idle" },
     };
+  if (method === "douyin.auth.status") {
+    const enabled = new URLSearchParams(location.search).get("douyin") === "1";
+    return {
+      configured: enabled,
+      can_sync: enabled,
+      capabilities: { auto_publish: enabled },
+      account: enabled
+        ? {
+            account_id: "douyin-preview",
+            binding_revision: 1,
+            nickname: "抖音预览账号",
+            auth_state: "valid",
+          }
+        : null,
+    };
+  }
   if (method === "accounts.list") return { items: accounts, limit: 5 };
   if (method === "auth.login.cancel") return { cancelled: true };
   if (method === "system.diagnostics")

@@ -33,7 +33,7 @@ class DesktopSettings:
         self.translation_upgrade_notice = False
         self.values = dict(work_dir=str(paths.root / "work"), bili_tid=171, bili_tags="转载",
                            bili_line="tx", upload_gap_seconds=20, theme="system",
-                           hwaccel="auto", validation_cache=True, **DEFAULTS)
+                           hwaccel="auto", validation_cache=True, douyin_broker_url="", **DEFAULTS)
         if self.path.exists():
             try:
                 saved = json.loads(self.path.read_text(encoding="utf-8"))
@@ -76,6 +76,13 @@ class DesktopSettings:
         if not isinstance(incoming, dict) or set(incoming) - set(self.values):
             raise Yt2BiliError("包含不支持的设置项。")
         merged = {**self.values, **incoming}
+        if not isinstance(merged["douyin_broker_url"], str):
+            raise Yt2BiliError("抖音服务地址格式无效。")
+        if merged["douyin_broker_url"]:
+            from urllib.parse import urlsplit
+            url = urlsplit(merged["douyin_broker_url"])
+            if url.scheme != "https" or not url.hostname or url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
+                raise Yt2BiliError("抖音服务地址必须为 HTTPS 源地址，不能携带凭据、路径或查询参数。")
         merged.update(validate_translation(merged))
         for name, lo, hi in (("bili_tid", 1, 65535), ("upload_gap_seconds", 0, 600)):
             if type(merged[name]) is not int or not lo <= merged[name] <= hi:

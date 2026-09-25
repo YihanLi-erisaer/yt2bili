@@ -188,13 +188,32 @@ class PipelineConcurrencyTests(unittest.TestCase):
         process.stdout = io.StringIO("out_time_us=1000000\nout_time_us=5000000\n")
         process.wait.return_value = 0
         process.poll.return_value = 0
-        with patch.object(media.subprocess, "Popen", return_value=process), \
-             patch.object(media.time, "monotonic", side_effect=[0, 6, 6, 12, 12]), \
+        with patch.object(media.subprocess, "Popen", return_value=process) as popen, \
+             patch.object(media.time, "monotonic", side_effect=[0, 1.1, 2.2]), \
+             patch.object(media.events, "progress") as progress, \
              self.assertLogs(media.logger, level=logging.INFO) as logs:
             result = media._decode_track(Path("first/source.mp4"), "v:0", 5, ["-hwaccel", "cuda"])
         self.assertEqual(result, 5)
         self.assertTrue(any("[first]" in line and "GPU" in line and "20.0%" in line for line in logs.output))
         self.assertTrue(any("100.0%" in line for line in logs.output))
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("-stats_period") + 1], "1")
+        self.assertAlmostEqual(progress.call_args_list[0].kwargs["speed_ratio"], 1 / 1.1)
+        self.assertAlmostEqual(progress.call_args_list[1].kwargs["speed_ratio"], 4 / 1.1)
+
+    def test_validation_fingerprint_reports_byte_speed_each_second(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "source.mp4"
+            tool = Path(folder) / "ffmpeg.exe"
+            path.write_bytes(b"x" * (9 * 1024 * 1024))
+            tool.write_bytes(b"tool")
+            with patch.object(media.shutil, "which", return_value=str(tool)), \
+                 patch.object(media.time, "monotonic", side_effect=[0, 1.1, 2.2]), \
+                 patch.object(media.events, "progress") as progress:
+                media._validation_fingerprint(path, 10)
+        self.assertEqual([call.args[0] for call in progress.call_args_list], ["hashing", "hashing"])
+        self.assertEqual(progress.call_args_list[-1].kwargs["percent"], 100)
+        self.assertGreater(progress.call_args_list[-1].kwargs["speed"], 0)
 
 
 if __name__ == "__main__":

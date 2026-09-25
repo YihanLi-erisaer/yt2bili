@@ -10,12 +10,14 @@ import io
 import json
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 from yt2bili.config import Settings
 from yt2bili.exceptions import Yt2BiliError
-from yt2bili import process_manager
+from yt2bili import events, process_manager
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +156,7 @@ def upload(
             settings.bili_tid,
             line_name,
         )
-        code, output = _run_logged(cmd, on_started=on_started) if on_started else _run_logged(cmd)
+        code, output = _run_logged(cmd, on_started=on_started, progress_total=video.stat().st_size)
         last_output = output
         if code == 0:
             bv = _parse_bv(output)
@@ -192,7 +194,54 @@ def _is_cert_failure(output: str) -> bool:
     return any(token in text for token in _CERT_FAIL)
 
 
-def _run_logged(cmd: list[str], on_started=None) -> tuple[int, str]:
+def _process_read_bytes(pid: int) -> int | None:
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessIoCounters.argtypes = (wintypes.HANDLE, ctypes.POINTER(IO_COUNTERS))
+        kernel32.GetProcessIoCounters.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            counters = IO_COUNTERS()
+            return counters.ReadTransferCount if kernel32.GetProcessIoCounters(handle, ctypes.byref(counters)) else None
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform.startswith("linux"):
+        try:
+            for line in Path(f"/proc/{pid}/io").read_text(encoding="ascii").splitlines():
+                if line.startswith("rchar:"):
+                    return int(line.split(":", 1)[1])
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _monitor_upload(pid: int, stop, report, state: dict) -> None:
+    previous = _process_read_bytes(pid)
+    previous_time = time.monotonic()
+    while not stop.wait(1):
+        current = _process_read_bytes(pid)
+        now = time.monotonic()
+        if current is not None and previous is not None and current >= previous and now > previous_time:
+            speed = (current - previous) / (now - previous_time)
+            state["speed"] = speed
+            report(speed=speed)
+        previous, previous_time = current, now
+
+
+def _run_logged(cmd: list[str], on_started=None, progress_total=None) -> tuple[int, str]:
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -203,15 +252,34 @@ def _run_logged(cmd: list[str], on_started=None) -> tuple[int, str]:
         **process_manager.creation_options(),
     )
     chunks: list[str] = []
+    stop = threading.Event()
+    monitor = None
+    progress_state = {}
     try:
         if on_started:
             on_started(process.pid)
+        report = events.capture_progress("uploading")
+        if report is not None and progress_total:
+            monitor = threading.Thread(target=_monitor_upload,
+                                       args=(process.pid, stop, report, progress_state),
+                                       name="upload-progress", daemon=True)
+            monitor.start()
         assert process.stdout is not None
         for line in process.stdout:
             logger.info("%s", line.rstrip())
             chunks.append(line)
-        return process.wait(), "".join(chunks)
+        code = process.wait()
+        stop.set()
+        if monitor:
+            monitor.join(2)
+            monitor = None
+        if report is not None and progress_total and code == 0:
+            report(speed=progress_state.get("speed"))
+        return code, "".join(chunks)
     finally:
+        stop.set()
+        if monitor:
+            monitor.join(2)
         # Do not release the UID lock while a failed log reader leaves biliup alive.
         if process.poll() is None:
             process.kill()

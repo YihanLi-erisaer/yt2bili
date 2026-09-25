@@ -44,7 +44,7 @@ class JointMigrationTests(unittest.TestCase):
                 self.assertEqual(store.get_job(task.task_id)["settings"]["translation_primary"], "local_llm")
                 self.assertEqual(store._conn.execute("SELECT task_id FROM translation_attempts").fetchone()[0], task.task_id)
                 self.assertEqual(store._conn.execute("SELECT id FROM legacy_operations").fetchone()[0], "op")
-                self.assertEqual(store._conn.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(store._conn.execute("PRAGMA user_version").fetchone()[0], 4)
                 self.assertEqual(store._conn.execute("PRAGMA foreign_key_check").fetchall(), [])
                 self.assertTrue(Path(str(path) + ".pre-v3.bak").exists())
             finally:
@@ -107,7 +107,7 @@ class JointMigrationTests(unittest.TestCase):
                 store = TaskStore(path)
                 try:
                     self.assertEqual(dict(store._conn.execute("SELECT * FROM tasks").fetchone()), before)
-                    self.assertEqual(store._conn.execute("PRAGMA user_version").fetchone()[0], 3)
+                    self.assertEqual(store._conn.execute("PRAGMA user_version").fetchone()[0], 4)
                     self.assertEqual(store._conn.execute("SELECT version FROM schema_migrations").fetchone()[0], 3)
                     self.assertEqual(store._conn.execute("SELECT * FROM import_conflicts").fetchall(), [])
                     self.assertEqual(store._conn.execute("PRAGMA foreign_key_check").fetchall(), [])

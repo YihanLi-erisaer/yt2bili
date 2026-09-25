@@ -55,8 +55,22 @@ def main(argv=None):
 
 def _dispatch(args, service):
     command, settings = args.command, service.config.build()
+    if command == "publication":
+        from yt2bili import publications
+        p = publications.get(service.store, args.publication_id)
+        if args.publication_action == "show":
+            print(json.dumps(p, ensure_ascii=False, indent=2))
+        elif args.publication_action == "submit":
+            service.submit(p["task_id"], str(uuid.uuid4()), [p["publication_id"]], {p["publication_id"]: p["revision"]})
+            while (service.store.get_job(p["task_id"]) or {}).get("execution_state") in ("queued", "running", "waiting"):
+                time.sleep(.2)
+            return 0 if publications.get(service.store, p["publication_id"])["status"] == "submitted" else 1
+        elif args.publication_action == "retry": service.retry_publication(p["publication_id"], str(uuid.uuid4()))
+        elif args.publication_action == "cancel": service.cancel_publication(p["publication_id"])
+        elif args.publication_action == "abandon": service.abandon_publication(p["publication_id"])
+        elif args.publication_action == "resolve": service.resolve_publication(p["publication_id"], args.remote_id, args.not_submitted)
+        return 0
     if command == "translation":
-        import json
         from dataclasses import asdict, replace
         from yt2bili.translation.config import snapshot, component_root
         from yt2bili.translation.runtime import status
@@ -98,10 +112,13 @@ def _dispatch(args, service):
                 continue
             logger.info("%s video=%s account=%s UID=%s %s %s", task.task_id, task.video_id,
                         task.account_id or "legacy_unbound", task.account_uid_snapshot, task.status, task.bv_id)
+            from yt2bili import publications
+            for pub in publications.items(service.store, task.task_id):
+                logger.info("  %s %s %s %s", pub["publication_id"], pub["platform"], pub["status"], pub["remote_id"])
         return 0
     op = str(uuid.uuid4())
     if args.command == "run":
-        result = service.create(args.url, op, args.account, "auto" if args.auto else "preview")
+        result = service.create(args.url, op, args.account, "auto" if args.auto else "preview", sync_douyin=getattr(args, "sync_douyin", False))
         task_id = result["task_id"]
         if not result["created"]:
             logger.info("已存在同账号任务：%s；不会重复执行。", task_id)
@@ -146,6 +163,12 @@ def _build_parser():
     yt = sub.add_parser("youtube-cookies")
     yt.add_argument("--browser", default=None)
     sub.add_parser("list").add_argument("--account")
+    publication = sub.add_parser("publication", help="按平台继续、确认、取消或核对投稿")
+    publication.add_argument("publication_action", choices=("show", "retry", "submit", "cancel", "abandon", "resolve"))
+    publication.add_argument("publication_id")
+    resolution = publication.add_mutually_exclusive_group()
+    resolution.add_argument("--remote-id", default="")
+    resolution.add_argument("--not-submitted", action="store_true")
     for command in ("login", "renew"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--account", required=True, help="原账号 account_id；新增用 accounts add")
@@ -160,6 +183,7 @@ def _build_parser():
     run = sub.add_parser("run", help="一次只接收一个 YouTube 视频链接")
     run.add_argument("url")
     run.add_argument("--account", required=True)
+    run.add_argument("--sync-douyin", action="store_true", help="同步到已绑定的抖音账号；需预先配置官方授权服务")
     mode = run.add_mutually_exclusive_group()
     mode.add_argument("--auto", action="store_true", help="素材准备好后自动投稿")
     mode.add_argument("--dry-run", action="store_true", help="准备素材等待确认（默认）")

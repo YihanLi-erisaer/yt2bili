@@ -107,7 +107,11 @@ class AccountService:
     def archive(self, account_id):
         with account_guard(self.store.account(account_id)["uid"]):
             with self.store.transaction():
-                if any(t.account_id == account_id and t.status != "submitted" for t in self.store.list_all()):
+                from yt2bili import publications
+                def unfinished(task):
+                    pub = publications.for_platform(self.store, task.task_id, "bilibili")
+                    return pub["status"] not in publications.TERMINAL if pub else task.status != "submitted"
+                if any(t.account_id == account_id and unfinished(t) for t in self.store.list_all()):
                     raise Yt2BiliError("账号仍有未完成任务，不能归档。")
                 self.store.update_account(account_id, lifecycle="archived", slot=None)
         self.emit("accounts.changed", {"account_id": account_id})

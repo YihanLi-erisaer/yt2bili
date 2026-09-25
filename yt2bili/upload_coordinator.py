@@ -11,7 +11,7 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from yt2bili import bili_upload, desktop_auth, events, pipeline
+from yt2bili import bili_upload, desktop_auth, events, pipeline, publications
 from yt2bili.db import _now
 from yt2bili.desktop_settings import atomic_json
 from yt2bili.exceptions import Yt2BiliError
@@ -35,7 +35,7 @@ class UploadCoordinator:
                 result = self._locked(item, task, account)
         except AccountBusy:
             return "account_busy", time.monotonic() + 1
-        if result[0] == "finished" and self.store.require(task.task_id).bv_id:
+        if result[0] == "finished" and self.store.require(task.task_id).bv_id and not getattr(item, "platform", ""):
             try:
                 self.cleanup(task.task_id)
             except OSError:
@@ -94,11 +94,13 @@ class UploadCoordinator:
                 saved = self.store.get_job(task.task_id)
                 if item.cancel.is_set() or current.cancel_requested or saved.get("run_id") != item.run_id:
                     raise events.Cancelled("任务已取消，未发起投稿。")
-                if current.status not in ("queued_upload",):
+                pub = publications.for_platform(self.store, task.task_id, "bilibili")
+                if (pub["status"] not in ("queued", "waiting") if getattr(item, "platform", "") and pub else current.status != "queued_upload"):
                     raise Yt2BiliError("任务状态已变化，未发起投稿。")
                 conn.execute("INSERT INTO upload_attempts(attempt_id,task_id,account_id,uid,run_id,prepared_at,outcome) VALUES(?,?,?,?,?,?,'prepared')",
                              (attempt_id, task.task_id, task.account_id, account["uid"], item.run_id, _now()))
                 self.store.update(task.task_id, status="uploading", wait_reason="", error="")
+                if pub: publications.change(self.store, pub["publication_id"], status="uploading_media")
             atomic_json(marker, {"inflight": attempt_id, "owner_pid": os.getpid(), "task_id": task.task_id})
             armed = True
 
@@ -119,6 +121,9 @@ class UploadCoordinator:
                              ("submitted" if bv else "unknown", bv, _now(), attempt_id))
                 self.store.update(task.task_id, status="submitted" if bv else "submission_unknown", bv_id=bv,
                                   error="" if bv else "未取得 BV 号，请核对该账号创作中心。", cleanup_state="pending" if bv else "none")
+                if pub:
+                    publications.change(self.store, pub["publication_id"], status="submitted" if bv else "submission_unknown", remote_id=bv, error="" if bv else "请核对创作中心。")
+                    publications.project(self.store, task.task_id)
         except BaseException as exc:
             if armed:
                 try:
@@ -130,6 +135,8 @@ class UploadCoordinator:
                 conn.execute("UPDATE upload_attempts SET outcome=?,ended_at=?,error=? WHERE attempt_id=?",
                              ("unknown" if started else "not_started", _now(), type(exc).__name__, attempt_id))
                 if started:
+                    pub = publications.for_platform(self.store, task.task_id, "bilibili")
+                    if pub: publications.change(self.store, pub["publication_id"], status="submitted" if bv else "submission_unknown", remote_id=bv, error="" if bv else "请核对创作中心。")
                     self.store.update(task.task_id, status="submitted" if bv else "submission_unknown", bv_id=bv,
                                       error="已获得 BV，后续保存/清理异常。" if bv else "投稿结果待核对，请检查该账号创作中心。")
                 elif self.store.require(task.task_id).status == "uploading":
@@ -143,6 +150,7 @@ class UploadCoordinator:
         return "finished", None
 
     def cleanup(self, task_id):
+        if not publications.can_cleanup(self.store, task_id): return
         task = self.store.require(task_id)
         if not task.work_dir:
             return

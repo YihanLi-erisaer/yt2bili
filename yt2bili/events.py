@@ -16,11 +16,13 @@ _local = threading.local()
 
 
 @contextmanager
-def task_context(video_id, cancel, emit, *, task_id=None, account_id=None, run_id=None):
+def task_context(video_id, cancel, emit, *, task_id=None, account_id=None, run_id=None, platform=None, publication_id=None):
     previous = getattr(_local, "context", None)
     _local.context = (video_id, cancel, emit)
     previous_identity = getattr(_local, "identity", {})
     _local.identity = {"task_id": task_id or video_id, "account_id": account_id, "run_id": run_id}
+    if platform:
+        _local.identity.update(platform=platform, publication_id=publication_id)
     _local.last_progress = 0.0
     try:
         check_cancelled()
@@ -60,6 +62,20 @@ def progress(stage, *, force=False, **payload):
         return
     _local.last_progress = now
     context[2]("task.progress", {"video_id": context[0], **current_identity(), "stage": stage, **payload})
+
+
+def capture_progress(stage):
+    """Capture the current task emitter for a short-lived helper thread."""
+    context = getattr(_local, "context", None)
+    if not context:
+        return None
+    video_id, _, emit = context
+    identity = current_identity()
+
+    def report(**payload):
+        emit("task.progress", {"video_id": video_id, **identity, "stage": stage, **payload})
+
+    return report
 
 
 def download_progress(data):

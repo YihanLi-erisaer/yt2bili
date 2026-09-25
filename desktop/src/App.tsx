@@ -56,12 +56,14 @@ import {
   editable,
   labels,
   retryable,
+  transferRate,
   type Config,
   type Progress,
   type Task,
 } from "./types";
 import SetupWizard from "./SetupWizard";
 import { AccountsPanel, AccountSelector, QueueOverview } from "./Accounts";
+import { DouyinAccountPanel, PublicationDetails } from "./Douyin";
 import { accountLabel, type BiliAccount } from "./types";
 import TranslationPanel from "./TranslationPanel";
 
@@ -73,6 +75,12 @@ const titles = {
   history: "投稿记录",
   account: "账号与连接",
   settings: "设置",
+};
+const progressSpeed = (progress?: Progress) => {
+  if (progress?.speed != null) return transferRate(progress.speed);
+  if (progress?.speed_ratio != null)
+    return `${progress.speed_ratio.toFixed(2)}×`;
+  return "";
 };
 
 function Modal({
@@ -257,6 +265,16 @@ export default function App() {
             : old,
         );
         setQueueActive(event.payload.active || []);
+      }
+      if (event.event === "publication.changed") {
+        void request<Task>("tasks.get", { task_id: event.payload.task_id })
+          .then((next) => {
+            setSelected((old) => (old?.task_id === next.task_id ? next : old));
+            setTasks((old) =>
+              old.map((t) => (t.task_id === next.task_id ? next : t)),
+            );
+          })
+          .catch(() => {});
       }
       if (event.event === "task.status") {
         const before = latestTasks.current[event.payload.task_id];
@@ -471,7 +489,7 @@ export default function App() {
             <div className="local-card">
               <ShieldCheck size={18} />
               <div>
-                在你的设备上运行<small>素材与凭据保留在本机</small>
+                在你的设备上运行<small>素材处理在本机 · 按平台授权投稿</small>
               </div>
             </div>
             <div className="sidebar-footer">
@@ -663,7 +681,12 @@ export default function App() {
                         全部任务 <span>{allTotal}</span>
                       </button>
                       {(page === "history"
-                        ? ["submitted", "submission_unknown"]
+                        ? [
+                            "submitted",
+                            "submission_unknown",
+                            "partial_success",
+                            "completed_with_abandon",
+                          ]
                         : ["ready", "failed"]
                       ).map((status) => (
                         <button
@@ -736,13 +759,20 @@ export default function App() {
                           <span>
                             <Status status={task.status} />
                             {active(task) && progress[task.task_id] && (
-                              <span className="mini-progress">
-                                <i
-                                  style={{
-                                    width: `${progress[task.task_id].percent ?? 25}%`,
-                                  }}
-                                />
-                              </span>
+                              <>
+                                <span className="mini-progress">
+                                  <i
+                                    style={{
+                                      width: `${progress[task.task_id].percent ?? 25}%`,
+                                    }}
+                                  />
+                                </span>
+                                {progressSpeed(progress[task.task_id]) && (
+                                  <small className="progress-speed">
+                                    {progressSpeed(progress[task.task_id])}
+                                  </small>
+                                )}
+                              </>
                             )}
                           </span>
                           <time>
@@ -983,6 +1013,19 @@ function NewTask({
   const [text, setText] = useState("");
   const [mode, setMode] = useState("preview");
   const [authorized, setAuthorized] = useState(false);
+  const [douyin, setDouyin] = useState<any>(null);
+  const [syncDouyin, setSyncDouyin] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    request("douyin.auth.status", { verify: true })
+      .then((s) => {
+        if (alive) setDouyin(s);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
   const op = useRef(operationId());
   return (
     <Modal title="新建任务" close={close}>
@@ -1041,10 +1084,37 @@ function NewTask({
           />
           <span>
             <strong>自动投稿</strong>
-            <small>素材准备好后，使用默认参数自动提交到 B 站。</small>
+            <small>素材准备好后，自动提交到本次选择的平台。</small>
           </span>
         </label>
       </div>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={syncDouyin}
+          disabled={!douyin?.can_sync}
+          onChange={(e) => {
+            setSyncDouyin(e.target.checked);
+            op.current = operationId();
+          }}
+        />
+        同步上传抖音{douyin?.account ? ` · ${douyin.account.nickname}` : ""}
+      </label>
+      {!douyin?.can_sync && (
+        <p className="help">
+          请先在“账号与连接”登录抖音，登录后才能勾选。{douyin?.error}
+        </p>
+      )}
+      {syncDouyin && (
+        <p className="help">
+          共用素材，两平台独立排队。预览模式一起确认；自动模式分别自动投稿。
+        </p>
+      )}
+      {syncDouyin && mode === "auto" && !douyin?.capabilities?.auto_publish && (
+        <p className="inline-error">
+          当前抖音服务未启用官方批准的自动发布能力，请选择预览模式。
+        </p>
+      )}
       <label className="checkbox">
         <input
           type="checkbox"
@@ -1059,13 +1129,28 @@ function NewTask({
         </button>
         <button
           className="primary"
-          disabled={busy || !text.trim() || !authorized || !accountId}
+          disabled={
+            busy ||
+            !text.trim() ||
+            !authorized ||
+            !accountId ||
+            (syncDouyin &&
+              mode === "auto" &&
+              !douyin?.capabilities?.auto_publish)
+          }
           onClick={() =>
             action(async () => {
               const result = await request("tasks.create", {
                 url: text,
                 account_id: accountId,
                 mode,
+                ...(syncDouyin
+                  ? {
+                      sync_douyin: true,
+                      douyin_account_id: douyin.account.account_id,
+                      douyin_binding_revision: douyin.account.binding_revision,
+                    }
+                  : {}),
                 operation_id: op.current,
               });
               if (!result.created)
@@ -1107,6 +1192,7 @@ function TaskDetail({
   const [logs, setLogs] = useState<any[]>([]);
   const [confirm, setConfirm] = useState("");
   const [bv, setBv] = useState("");
+  const [douyinDirty, setDouyinDirty] = useState(false);
   const op = useRef(operationId());
   useEffect(() => {
     setTitle(task.title_zh);
@@ -1138,6 +1224,17 @@ function TaskDetail({
       await request(method, {
         task_id: task.task_id,
         operation_id: op.current,
+        ...(method === "tasks.submit" &&
+        task.publications?.some((p) => p.platform === "douyin")
+          ? {
+              targets: task.publications
+                .filter((p) => p.status === "ready")
+                .map((p) => p.publication_id),
+              revisions: Object.fromEntries(
+                task.publications.map((p) => [p.publication_id, p.revision]),
+              ),
+            }
+          : {}),
       });
       op.current = operationId();
       setConfirm("");
@@ -1190,6 +1287,16 @@ function TaskDetail({
         </div>
       </div>
       {task.error && <div className="inline-error">{task.error}</div>}
+      {task.publications?.some((p) => p.platform === "douyin") && (
+        <PublicationDetails
+          task={task}
+          busy={busy}
+          action={action}
+          refresh={refresh}
+          dirty={douyinDirty}
+          onDirtyChange={setDouyinDirty}
+        />
+      )}
       {active(task) && (
         <div className="detail-progress">
           <span>
@@ -1198,6 +1305,7 @@ function TaskDetail({
               ? ` · ${progress.provider === "local_llm" ? "本地大模型" : "DeepL"}`
               : ""}
             {progress?.track && ` · ${progress.track} · ${progress.backend}`}{" "}
+            {progressSpeed(progress) && `· ${progressSpeed(progress)} `}
             {progress?.remaining
               ? `· 剩余 ${Math.ceil(progress.remaining)} 秒`
               : ""}
@@ -1350,48 +1458,52 @@ function TaskDetail({
           )}
         </div>
       )}
-      {task.status === "submission_unknown" && (
-        <div className="resolve-box">
-          <strong>先核对创作中心，再继续处理</strong>
-          <p>网络中断不一定代表投稿失败。登记 BV 号会保留本地素材。</p>
-          <button
-            className="text-button"
-            onClick={() =>
-              external(
-                "https://member.bilibili.com/platform/upload-manager/article",
-              )
-            }
-          >
-            打开创作中心 <ExternalLink size={14} />
-          </button>
-          <div className="inline-controls">
-            <input
-              aria-label="登记 BV 号"
-              value={bv}
-              onChange={(e) => setBv(e.target.value)}
-              placeholder="BV…"
-            />
+      {task.status === "submission_unknown" &&
+        !task.publications?.some((p) => p.platform === "douyin") && (
+          <div className="resolve-box">
+            <strong>先核对创作中心，再继续处理</strong>
+            <p>网络中断不一定代表投稿失败。登记 BV 号会保留本地素材。</p>
             <button
-              className="secondary"
-              disabled={busy}
+              className="text-button"
               onClick={() =>
-                action(async () => {
-                  await request("tasks.resolve", {
-                    task_id: task.task_id,
-                    bv_id: bv,
-                  });
-                  await refresh();
-                }, "BV 号已登记。")
+                external(
+                  "https://member.bilibili.com/platform/upload-manager/article",
+                )
               }
             >
-              登记已提交稿件
+              打开创作中心 <ExternalLink size={14} />
+            </button>
+            <div className="inline-controls">
+              <input
+                aria-label="登记 BV 号"
+                value={bv}
+                onChange={(e) => setBv(e.target.value)}
+                placeholder="BV…"
+              />
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() =>
+                  action(async () => {
+                    await request("tasks.resolve", {
+                      task_id: task.task_id,
+                      bv_id: bv,
+                    });
+                    await refresh();
+                  }, "BV 号已登记。")
+                }
+              >
+                登记已提交稿件
+              </button>
+            </div>
+            <button
+              className="text-button"
+              onClick={() => setConfirm("resolve")}
+            >
+              我已核对，确实没有提交
             </button>
           </div>
-          <button className="text-button" onClick={() => setConfirm("resolve")}>
-            我已核对，确实没有提交
-          </button>
-        </div>
-      )}
+        )}
       {editable(task) && (
         <button
           className="text-button"
@@ -1425,7 +1537,7 @@ function TaskDetail({
             {confirm === "retranslate"
               ? "重新翻译将替换当前标题与简介（含人工修改），完成后需重新预览。确定继续？"
               : confirm === "submit"
-                ? `确认投稿到 ${task.account_name_snapshot} · UID ${task.account_uid_snapshot}？`
+                ? `确认投稿到 ${task.account_name_snapshot} · UID ${task.account_uid_snapshot}${task.publications?.some((p) => p.platform === "douyin") ? "，并同步提交到已绑定的抖音账号" : ""}？`
                 : confirm === "repair"
                   ? "准备原稿件的替换视频？此操作不会投稿。"
                   : "确认创作中心没有这条稿件？"}
@@ -1491,7 +1603,8 @@ function TaskDetail({
               busy ||
               !task.account_id ||
               title !== task.title_zh ||
-              description !== task.desc_zh
+              description !== task.desc_zh ||
+              douyinDirty
             }
             title="请先保存修改"
             onClick={() => setConfirm("submit")}
@@ -1566,6 +1679,7 @@ function Account({
   return (
     <div className="settings-stack">
       <AccountsPanel auth={auth} refresh={refresh} />
+      <DouyinAccountPanel />
       <TranslationPanel
         config={config}
         busy={busy}

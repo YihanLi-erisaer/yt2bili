@@ -498,7 +498,7 @@ def _base_opts(settings: Settings) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "progress_hooks": [events.download_progress],
         "quiet": False,
-        "progress_delta": 2,
+        "progress_delta": 1,
         "no_warnings": False,
         "noplaylist": True,
         "ignoreerrors": False,

@@ -1,4 +1,16 @@
+export interface Publication {
+  account_label?: string;
+  publication_id: string;
+  platform: "bilibili" | "douyin";
+  account_id: string;
+  status: string;
+  revision: number;
+  text: string;
+  remote_id: string;
+  error: string;
+}
 export interface Task {
+  publications?: Publication[];
   task_id: string;
   account_id: string | null;
   account_uid_snapshot: string | null;
@@ -63,6 +75,7 @@ export interface Progress {
   stage: string;
   percent?: number | null;
   speed?: number;
+  speed_ratio?: number;
   eta?: number;
   remaining?: number;
   track?: string;
@@ -70,6 +83,15 @@ export interface Progress {
   provider?: string;
 }
 export const labels: Record<string, string> = {
+  partial_success: "部分已提交",
+  completed_with_abandon: "已结束（部分放弃）",
+  pending_assets: "等待共享素材",
+  blocked_validation: "平台校验未通过",
+  queued: "等待投稿",
+  waiting: "等待恢复",
+  uploading_media: "上传素材",
+  creating: "创建作品",
+  abandoned: "已放弃",
   pending: "等待处理",
   fetching_meta: "读取信息",
   queued_download: "等待下载",
@@ -103,11 +125,20 @@ export const active = (task: Task) =>
     "cancelled",
     "interrupted",
     "submission_unknown",
+    "partial_success",
+    "completed_with_abandon",
   ].includes(task.status);
 export function bytes(value: number) {
   return value >= 1024 ** 3
     ? `${(value / 1024 ** 3).toFixed(1)} GB`
     : `${(value / 1024 ** 2).toFixed(1)} MB`;
+}
+export function transferRate(value: number) {
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB/s`;
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB/s`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB/s`;
+  return `${Math.round(value)} B/s`;
 }
 export interface BiliAccount {
   account_id: string;

@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from yt2bili.exceptions import Yt2BiliError
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STATUSES = ("pending", "fetching_meta", "downloading", "queued_download", "queued_validation",
             "validating", "queued_upload", "processing_cover", "translating", "ready", "uploading",
-            "submitted", "failed", "cancel_requested", "cancelled", "interrupted", "submission_unknown")
+            "submitted", "failed", "cancel_requested", "cancelled", "interrupted", "submission_unknown",
+            "partial_success", "completed_with_abandon")
 
 
 @dataclass
@@ -67,7 +68,7 @@ class TaskStore:
                 raise Yt2BiliError("检测到其他分支的同版本数据库，请先进行联合迁移；原库未修改。")
         if version < SCHEMA_VERSION:
             if db_path.stat().st_size:
-                suffix = ".pre-desktop.bak" if version == 0 else ".pre-v3.bak"
+                suffix = ".pre-desktop.bak" if version == 0 else (".pre-v4.bak" if version == 3 else ".pre-v3.bak")
                 backup_path = Path(str(db_path) + suffix)
                 if backup_path.exists():
                     backup_path = Path(str(backup_path) + "." + uuid.uuid4().hex)
@@ -75,6 +76,8 @@ class TaskStore:
                     self._conn.backup(backup)
             try:
                 self._migrate()
+                from yt2bili.publications import migrate
+                migrate(self)
             except BaseException:
                 self._conn.close()
                 raise
@@ -91,8 +94,8 @@ class TaskStore:
                 self._translation_schema()
                 if self._conn.execute("PRAGMA foreign_key_check").fetchone():
                     raise Yt2BiliError("数据库迁移引用检查失败。")
-                self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-                self._conn.execute("INSERT OR REPLACE INTO schema_migrations VALUES(?,?)", (SCHEMA_VERSION, _now()))
+                self._conn.execute("PRAGMA user_version=3")
+                self._conn.execute("INSERT OR REPLACE INTO schema_migrations VALUES(?,?)", (3, _now()))
                 return
             old = [dict(r) for r in self._conn.execute("SELECT * FROM tasks")] if "tasks" in tables else []
             jobs = [dict(r) for r in self._conn.execute("SELECT * FROM desktop_jobs")] if "desktop_jobs" in tables else []
@@ -171,8 +174,8 @@ class TaskStore:
             for row in attempts:
                 if row["video_id"] in mapping:
                     self._conn.execute("INSERT INTO translation_attempts(task_id,payload) VALUES(?,?)", (mapping[row["video_id"]], row["payload"]))
-            self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            self._conn.execute("INSERT INTO schema_migrations VALUES(?,?)", (SCHEMA_VERSION, _now()))
+            self._conn.execute("PRAGMA user_version=3")
+            self._conn.execute("INSERT INTO schema_migrations VALUES(?,?)", (3, _now()))
             if self._conn.execute("PRAGMA foreign_key_check").fetchone():
                 raise Yt2BiliError("数据库迁移引用检查失败。")
             self._events.clear()

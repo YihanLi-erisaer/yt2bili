@@ -24,7 +24,7 @@ MAX_MESSAGE = 1_048_576
 
 def redact(text):
     text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", str(text))
-    if re.search(r"(?i)(sessdata|bili_jct|access_token|refresh_token|auth_code|auth_key|authorization|set-cookie|cookie_info)\s*[=:：\"']", text):
+    if re.search(r"(?i)(sessdata|bili_jct|access_token|refresh_token|auth_code|auth_key|client_secret|pairing_key|encryption_key|authorization|set-cookie|cookie_info)\s*[=:：\"']", text):
         return "[包含凭据信息的日志已隐藏]"
     text = re.sub(r"\b[0-9a-fA-F-]{30,}:fx\b", "[密钥已隐藏]", text)
     return text[:4000]

@@ -131,11 +131,25 @@ def _validation_fingerprint(path: Path, expected_duration) -> dict:
     # Hash the whole file, not just its head/tail: same-size middle corruption
     # must invalidate even a cache hit with a restored modification timestamp.
     digest = hashlib.sha256()
+    total = path.stat().st_size
+    done = 0
+    last_done = 0
+    last_report = time.monotonic()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             events.check_cancelled()
-            events.progress("hashing", percent=None)
             digest.update(chunk)
+            done += len(chunk)
+            now = time.monotonic()
+            if now - last_report >= 1:
+                events.progress("hashing", force=True, percent=min(100, done / total * 100) if total else None,
+                                bytes=done, total=total, speed=(done - last_done) / (now - last_report))
+                last_done, last_report = done, now
+    if done != last_done:
+        now = time.monotonic()
+        elapsed = now - last_report
+        events.progress("hashing", force=True, percent=100 if total else None, bytes=done, total=total,
+                        speed=(done - last_done) / elapsed if elapsed > 0 else None)
     tool_states = []
     for name in ("ffmpeg", "ffprobe"):
         tool = Path(shutil.which(ffmpeg_tool(name)) or ffmpeg_tool(name)).resolve()
@@ -186,17 +200,18 @@ def _write_validation_cache(path: Path, fingerprint: dict) -> None:
 def _decode_track(path: Path, stream: str, expected, acceleration: list[str]) -> float:
     backend = "GPU" if acceleration else "CPU"
 
-    def report(actual: float) -> None:
+    def report(actual: float, speed_ratio: float | None) -> None:
         events.progress("validating", percent=min(100, actual / expected * 100) if expected else None,
-                        track=stream, seconds=actual, backend=backend)
+                        track=stream, seconds=actual, backend=backend, speed_ratio=speed_ratio)
         percent = f"{min(100.0, actual / expected * 100):.1f}%" if expected else "未知总时长"
-        logger.info("校验进度 [%s] %s %s %s：%.1f / %s 秒（%s）",
-                    path.parent.name, path.name, stream, backend, actual, expected or "?", percent)
+        speed_text = f"，{speed_ratio:.2f}x" if speed_ratio is not None else ""
+        logger.info("校验进度 [%s] %s %s %s：%.1f / %s 秒（%s%s）",
+                    path.parent.name, path.name, stream, backend, actual, expected or "?", percent, speed_text)
 
     cmd = [
         ffmpeg_tool("ffmpeg"), "-nostdin", "-hide_banner", "-v", "error", "-xerror",
         "-err_detect", "explode", *acceleration, "-i", str(path), "-map", f"0:{stream}",
-        "-progress", "pipe:1", "-stats_period", "5", "-nostats", "-f", "null", "-",
+        "-progress", "pipe:1", "-stats_period", "1", "-nostats", "-f", "null", "-",
     ]
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, text=True, encoding="utf-8", errors="replace", **process_manager.creation_options())
@@ -204,6 +219,8 @@ def _decode_track(path: Path, stream: str, expected, acceleration: list[str]) ->
         watcher.__enter__()
         actual = 0.0
         last_report = time.monotonic()
+        last_actual = 0.0
+        last_speed = None
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -213,9 +230,11 @@ def _decode_track(path: Path, stream: str, expected, acceleration: list[str]) ->
                 if not value.lstrip("-").isdigit():
                     continue
                 actual = max(actual, int(value) / 1_000_000)
-                if time.monotonic() - last_report >= 5:
-                    report(actual)
-                    last_report = time.monotonic()
+                now = time.monotonic()
+                if now - last_report >= 1:
+                    last_speed = max(0.0, (actual - last_actual) / (now - last_report))
+                    report(actual, last_speed)
+                    last_actual, last_report = actual, now
             returncode = process.wait()
         finally:
             watcher.__exit__(None, None, None)
@@ -231,7 +250,7 @@ def _decode_track(path: Path, stream: str, expected, acceleration: list[str]) ->
         raise InvalidMediaError(f"{path.name} 的 {stream} 解码失败：{detail or returncode}")
     if not duration_looks_complete(actual, expected):
         raise InvalidMediaError(f"{path.name} 的 {stream} 实际仅 {actual:.2f}s，预期 {expected}s；需要重新下载。")
-    report(actual)
+    report(actual, last_speed)
     return actual
 
 

@@ -675,6 +675,12 @@ kbd {
   display: block;
   background: var(--blue);
 }
+.progress-speed {
+  display: block;
+  margin: 5px 0 0 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
 .empty-state {
   display: flex;
   align-items: center;
