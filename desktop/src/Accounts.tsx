@@ -299,6 +299,7 @@ export function QueueOverview({
         { label: "共享校验", ...queue?.validate },
         { label: "共享封面 / 翻译", ...queue?.prepare },
         { label: "抖音独立上传", ...queue?.douyin },
+        { label: "AcFun 独立上传", ...queue?.acfun },
         ...(queue?.uploads || []).map((q: any) => ({
           ...q,
           label: accounts.find((a) => a.account_id === q.account_id)

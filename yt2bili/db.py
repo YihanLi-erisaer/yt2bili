@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from yt2bili.exceptions import Yt2BiliError
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 STATUSES = ("pending", "fetching_meta", "downloading", "queued_download", "queued_validation",
             "validating", "queued_upload", "processing_cover", "translating", "ready", "uploading",
             "submitted", "failed", "cancel_requested", "cancelled", "interrupted", "submission_unknown",
@@ -61,23 +61,25 @@ class TaskStore:
         if version > SCHEMA_VERSION:
             self._conn.close()
             raise Yt2BiliError("数据库版本高于当前程序，请使用更新版本。")
-        if version == SCHEMA_VERSION:
+        if version >= 4:
             columns = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)")}
             if not {"task_id", "account_id", "account_uid_snapshot"} <= columns:
                 self._conn.close()
                 raise Yt2BiliError("检测到其他分支的同版本数据库，请先进行联合迁移；原库未修改。")
         if version < SCHEMA_VERSION:
             if db_path.stat().st_size:
-                suffix = ".pre-desktop.bak" if version == 0 else (".pre-v4.bak" if version == 3 else ".pre-v3.bak")
+                suffix = ".pre-v5.bak" if version == 4 else (".pre-desktop.bak" if version == 0 else (".pre-v4.bak" if version == 3 else ".pre-v3.bak"))
                 backup_path = Path(str(db_path) + suffix)
                 if backup_path.exists():
                     backup_path = Path(str(backup_path) + "." + uuid.uuid4().hex)
                 with closing(sqlite3.connect(backup_path)) as backup:
                     self._conn.backup(backup)
             try:
-                self._migrate()
-                from yt2bili.publications import migrate
-                migrate(self)
+                from yt2bili import publications
+                if version < 4:
+                    self._migrate()
+                    publications.migrate(self)
+                publications.migrate_acfun(self)
             except BaseException:
                 self._conn.close()
                 raise

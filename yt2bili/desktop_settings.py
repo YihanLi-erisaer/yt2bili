@@ -33,7 +33,8 @@ class DesktopSettings:
         self.translation_upgrade_notice = False
         self.values = dict(work_dir=str(paths.root / "work"), bili_tid=171, bili_tags="转载",
                            bili_line="tx", upload_gap_seconds=20, theme="system",
-                           hwaccel="auto", validation_cache=True, douyin_broker_url="", **DEFAULTS)
+                           hwaccel="auto", validation_cache=True, douyin_broker_url="",
+                           acfun_experimental_enabled=False, **DEFAULTS)
         if self.path.exists():
             try:
                 saved = json.loads(self.path.read_text(encoding="utf-8"))
@@ -95,6 +96,8 @@ class DesktopSettings:
             raise Yt2BiliError("请填写有效标签（不超过 200 字）。")
         if type(merged["validation_cache"]) is not bool:
             raise Yt2BiliError("校验缓存必须为开关值。")
+        if type(merged["acfun_experimental_enabled"]) is not bool:
+            raise Yt2BiliError("AcFun 实验性接入必须为开关值。")
         if not isinstance(merged["work_dir"], str) or not Path(merged["work_dir"]).is_absolute():
             raise Yt2BiliError("工作目录必须为绝对路径。")
         target = Path(merged["work_dir"]).resolve()

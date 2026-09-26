@@ -64,6 +64,7 @@ import {
 import SetupWizard from "./SetupWizard";
 import { AccountsPanel, AccountSelector, QueueOverview } from "./Accounts";
 import { DouyinAccountPanel, PublicationDetails } from "./Douyin";
+import { AcfunAccountPanel } from "./Acfun";
 import { accountLabel, type BiliAccount } from "./types";
 import TranslationPanel from "./TranslationPanel";
 
@@ -313,6 +314,7 @@ export default function App() {
         setProgress((old) => ({
           ...old,
           [event.payload.task_id]: event.payload,
+          ...(event.payload.publication_id ? { [event.payload.publication_id]: event.payload } : {}),
         }));
       if (event.event === "auth.status") {
         setAuth((old: any) => ({
@@ -944,6 +946,7 @@ export default function App() {
             task={selected}
             accounts={accountOptions}
             progress={progress[selected.task_id]}
+            progressMap={progress}
             busy={busy}
             action={action}
             close={() => setSelected(null)}
@@ -1015,12 +1018,17 @@ function NewTask({
   const [authorized, setAuthorized] = useState(false);
   const [douyin, setDouyin] = useState<any>(null);
   const [syncDouyin, setSyncDouyin] = useState(false);
+  const [acfun, setAcfun] = useState<any>(null);
+  const [syncAcfun, setSyncAcfun] = useState(false);
   useEffect(() => {
     let alive = true;
     request("douyin.auth.status", { verify: true })
       .then((s) => {
         if (alive) setDouyin(s);
       })
+      .catch(() => {});
+    request("acfun.auth.status", { verify: true })
+      .then((s) => { if (alive) setAcfun(s); })
       .catch(() => {});
     return () => {
       alive = false;
@@ -1079,6 +1087,7 @@ function NewTask({
             checked={mode === "auto"}
             onChange={() => {
               setMode("auto");
+              setSyncAcfun(false);
               op.current = operationId();
             }}
           />
@@ -1116,6 +1125,14 @@ function NewTask({
         </p>
       )}
       <label className="checkbox">
+        <input type="checkbox" checked={syncAcfun} disabled={!acfun?.can_sync || mode === "auto"}
+          onChange={(e) => { setSyncAcfun(e.target.checked); op.current = operationId(); }} />
+        同步上传 AcFun{acfun?.account ? ` · ${acfun.account.nickname}` : ""}
+      </label>
+      {!acfun?.can_sync && <p className="help">请先在“账号与连接”扫码并启用 AcFun 实验性接入。{acfun?.error}</p>}
+      {mode === "auto" && acfun?.can_sync && <p className="help">AcFun 网页投稿仅支持准备素材并预览。</p>}
+      {syncAcfun && <p className="help">AcFun 使用独立队列；准备好素材后填写分区和投稿信息，再确认上传。</p>}
+      <label className="checkbox">
         <input
           type="checkbox"
           checked={authorized}
@@ -1136,7 +1153,8 @@ function NewTask({
             !accountId ||
             (syncDouyin &&
               mode === "auto" &&
-              !douyin?.capabilities?.auto_publish)
+              !douyin?.capabilities?.auto_publish) ||
+            (syncAcfun && mode === "auto")
           }
           onClick={() =>
             action(async () => {
@@ -1151,6 +1169,11 @@ function NewTask({
                       douyin_binding_revision: douyin.account.binding_revision,
                     }
                   : {}),
+                ...(syncAcfun ? {
+                  sync_acfun: true,
+                  acfun_account_id: acfun.account.account_id,
+                  acfun_binding_revision: acfun.account.binding_revision,
+                } : {}),
                 operation_id: op.current,
               });
               if (!result.created)
@@ -1171,6 +1194,7 @@ function TaskDetail({
   accounts,
   task,
   progress,
+  progressMap,
   busy,
   action,
   close,
@@ -1179,6 +1203,7 @@ function TaskDetail({
   accounts: BiliAccount[];
   task: Task;
   progress?: Progress;
+  progressMap: Record<string, Progress>;
   busy: boolean;
   action: Action;
   close: () => void;
@@ -1225,7 +1250,7 @@ function TaskDetail({
         task_id: task.task_id,
         operation_id: op.current,
         ...(method === "tasks.submit" &&
-        task.publications?.some((p) => p.platform === "douyin")
+        task.publications?.some((p) => p.platform !== "bilibili")
           ? {
               targets: task.publications
                 .filter((p) => p.status === "ready")
@@ -1287,7 +1312,7 @@ function TaskDetail({
         </div>
       </div>
       {task.error && <div className="inline-error">{task.error}</div>}
-      {task.publications?.some((p) => p.platform === "douyin") && (
+      {task.publications?.some((p) => p.platform !== "bilibili") && (
         <PublicationDetails
           task={task}
           busy={busy}
@@ -1295,6 +1320,7 @@ function TaskDetail({
           refresh={refresh}
           dirty={douyinDirty}
           onDirtyChange={setDouyinDirty}
+          progressMap={progressMap}
         />
       )}
       {active(task) && (
@@ -1459,7 +1485,7 @@ function TaskDetail({
         </div>
       )}
       {task.status === "submission_unknown" &&
-        !task.publications?.some((p) => p.platform === "douyin") && (
+        !task.publications?.some((p) => p.platform !== "bilibili") && (
           <div className="resolve-box">
             <strong>先核对创作中心，再继续处理</strong>
             <p>网络中断不一定代表投稿失败。登记 BV 号会保留本地素材。</p>
@@ -1537,7 +1563,7 @@ function TaskDetail({
             {confirm === "retranslate"
               ? "重新翻译将替换当前标题与简介（含人工修改），完成后需重新预览。确定继续？"
               : confirm === "submit"
-                ? `确认投稿到 ${task.account_name_snapshot} · UID ${task.account_uid_snapshot}${task.publications?.some((p) => p.platform === "douyin") ? "，并同步提交到已绑定的抖音账号" : ""}？`
+                ? `确认投稿到 ${task.account_name_snapshot} · UID ${task.account_uid_snapshot}${task.publications?.some((p) => p.platform === "douyin") ? "，并同步到抖音" : ""}${task.publications?.some((p) => p.platform === "acfun") ? "，并同步到 AcFun" : ""}？`
                 : confirm === "repair"
                   ? "准备原稿件的替换视频？此操作不会投稿。"
                   : "确认创作中心没有这条稿件？"}
@@ -1680,6 +1706,7 @@ function Account({
     <div className="settings-stack">
       <AccountsPanel auth={auth} refresh={refresh} />
       <DouyinAccountPanel />
+      <AcfunAccountPanel />
       <TranslationPanel
         config={config}
         busy={busy}

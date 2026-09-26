@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { operationId, request } from "./bridge";
-import { labels, type Task, type Publication } from "./types";
+import { labels, type Task, type Publication, type Progress } from "./types";
 
 export function DouyinAccountPanel() {
   const [status, setStatus] = useState<any>(null);
@@ -149,18 +149,31 @@ function PublicationCard({
   busy,
   run,
   onDirtyChange,
+  progress,
 }: {
   pub: Publication;
   busy: boolean;
   run: (work: () => Promise<unknown>) => Promise<void>;
-  onDirtyChange: (dirty: boolean) => void;
+  onDirtyChange: (id: string, dirty: boolean) => void;
+  progress?: Progress;
 }) {
   const [text, setText] = useState(pub.text);
+  const acfun = (() => { try { return JSON.parse(pub.snapshot || "{}"); } catch { return {}; } })();
+  const [title, setTitle] = useState(acfun.title || "");
+  const [description, setDescription] = useState(acfun.description || "");
+  const [channelId, setChannelId] = useState(String(acfun.channel_id || ""));
+  const [tags, setTags] = useState((acfun.tags || []).join("、"));
   const [remote, setRemote] = useState("");
   useEffect(() => setText(pub.text), [pub.text, pub.publication_id]);
   useEffect(() => {
-    if (pub.platform === "douyin") onDirtyChange(text !== pub.text);
-  }, [text, pub.text, pub.platform, onDirtyChange]);
+    setTitle(acfun.title || ""); setDescription(acfun.description || "");
+    setChannelId(String(acfun.channel_id || "")); setTags((acfun.tags || []).join("、"));
+  }, [pub.snapshot, pub.publication_id]);
+  useEffect(() => {
+    const changed = pub.platform === "douyin" ? text !== pub.text : pub.platform === "acfun" &&
+      (title !== (acfun.title || "") || description !== (acfun.description || "") || channelId !== String(acfun.channel_id || "") || tags !== (acfun.tags || []).join("、"));
+    onDirtyChange(pub.publication_id, changed);
+  }, [text, title, description, channelId, tags, pub.text, pub.snapshot, pub.platform, onDirtyChange]);
   const call = (method: string, extra = {}) =>
     run(() =>
       request(method, { publication_id: pub.publication_id, ...extra }),
@@ -168,7 +181,7 @@ function PublicationCard({
   return (
     <div className="section-body">
       <strong>
-        {pub.platform === "douyin" ? "抖音" : "Bilibili"} ·{" "}
+        {{ douyin: "抖音", acfun: "AcFun", bilibili: "Bilibili" }[pub.platform]} ·{" "}
         {labels[pub.status] || pub.status}
       </strong>
       <p className="help">
@@ -176,6 +189,7 @@ function PublicationCard({
         {pub.remote_id && ` · 作品 ID：${pub.remote_id}`}
       </p>
       {pub.error && <p className="inline-error">{pub.error}</p>}
+      {pub.status === "uploading_media" && progress?.percent != null && <p className="help">{pub.platform === "acfun" ? "AcFun" : "平台"}上传：{progress.percent.toFixed(1)}%</p>}
       {pub.platform === "douyin" && (
         <label className="field">
           抖音文案（独立于 B 站简介）
@@ -200,6 +214,15 @@ function PublicationCard({
           )}
         </label>
       )}
+      {pub.platform === "acfun" && <div>
+        <p className="help">AcFun 转载投稿：请填写平台分区 ID，并核对标题、简介与标签。来源链接使用原 YouTube URL。</p>
+        <label className="field">AcFun 标题<input value={title} maxLength={50} disabled={busy || pub.status !== "ready"} onChange={(e) => setTitle(e.target.value)} /></label>
+        <label className="field">AcFun 简介<textarea value={description} maxLength={1000} disabled={busy || pub.status !== "ready"} onChange={(e) => setDescription(e.target.value)} /></label>
+        <label className="field">分区 ID<input type="number" min={1} value={channelId} disabled={busy || pub.status !== "ready"} onChange={(e) => setChannelId(e.target.value)} /></label>
+        <label className="field">标签（用顿号分隔，最多 6 个）<input value={tags} disabled={busy || pub.status !== "ready"} onChange={(e) => setTags(e.target.value)} /></label>
+        {pub.status === "ready" && <button disabled={busy || !title.trim() || !Number.isInteger(Number(channelId)) || Number(channelId) <= 0}
+          onClick={() => void call("publications.update_metadata", { revision: pub.revision, title, description, channel_id: Number(channelId), tags: tags.split(/[、,，]/).map((x: string) => x.trim()).filter(Boolean) })}>保存 AcFun 投稿信息</button>}
+      </div>}
       <div className="modal-actions">
         {["failed", "cancelled", "interrupted", "blocked_validation"].includes(
           pub.status,
@@ -289,6 +312,7 @@ export function PublicationDetails({
   refresh,
   dirty,
   onDirtyChange,
+  progressMap,
 }: {
   task: Task;
   busy: boolean;
@@ -296,7 +320,13 @@ export function PublicationDetails({
   refresh: () => Promise<void>;
   dirty: boolean;
   onDirtyChange: (dirty: boolean) => void;
+  progressMap: Record<string, Progress>;
 }) {
+  const [dirtyIds, setDirtyIds] = useState<string[]>([]);
+  useEffect(() => onDirtyChange(dirtyIds.length > 0), [dirtyIds, onDirtyChange]);
+  const markDirty = useCallback((id: string, value: boolean) => setDirtyIds((current) => value
+    ? (current.includes(id) ? current : [...current, id])
+    : (current.includes(id) ? current.filter((x) => x !== id) : current)), []);
   const run = (work: () => Promise<unknown>) =>
     action(async () => {
       await work();
@@ -311,7 +341,8 @@ export function PublicationDetails({
           pub={pub}
           busy={busy}
           run={run}
-          onDirtyChange={onDirtyChange}
+          onDirtyChange={markDirty}
+          progress={progressMap[pub.publication_id]}
         />
       ))}
       {task.status === "partial_success" &&

@@ -39,6 +39,58 @@ def migrate(store):
         db.execute("INSERT OR REPLACE INTO schema_migrations VALUES(4,?)", (_now(),))
 
 
+def migrate_acfun(store):
+    """Rebuild the platform CHECK without changing any existing publication identity."""
+    with store.transaction() as db:
+        schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_publications'").fetchone()
+        if schema and "'acfun'" in schema[0]:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='acfun_accounts'").fetchone():
+                raise Yt2BiliError("AcFun 表结构不完整，请从迁移备份恢复。")
+            db.execute("PRAGMA user_version=5")
+            db.execute("INSERT OR REPLACE INTO schema_migrations VALUES(5,?)", (_now(),))
+            return
+        db.execute("""CREATE TABLE IF NOT EXISTS acfun_accounts(
+            account_id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE,
+            nickname TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'active',
+            auth_state TEXT NOT NULL DEFAULT 'valid', binding_revision INTEGER NOT NULL DEFAULT 1,
+            adapter_version TEXT NOT NULL DEFAULT 'web-v1')""")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_acfun_slot ON acfun_accounts(lifecycle) WHERE lifecycle='active'")
+        db.execute("""CREATE TRIGGER IF NOT EXISTS immutable_acfun_identity BEFORE UPDATE OF user_id ON acfun_accounts
+            BEGIN SELECT RAISE(ABORT,'ACCOUNT_IDENTITY_IMMUTABLE'); END""")
+        before = db.execute("SELECT count(*) FROM task_publications").fetchone()[0]
+        db.execute("DROP TRIGGER IF EXISTS immutable_publication_identity")
+        db.execute("""CREATE TABLE task_publications_v5(
+            publication_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id),
+            platform TEXT NOT NULL CHECK(platform IN ('bilibili','douyin','acfun')), account_id TEXT,
+            source_video_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending_assets',
+            revision INTEGER NOT NULL DEFAULT 0, text TEXT NOT NULL DEFAULT '',
+            remote_id TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+            retain_assets INTEGER NOT NULL DEFAULT 0, snapshot TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(task_id,platform))""")
+        db.execute("INSERT INTO task_publications_v5 SELECT * FROM task_publications")
+        if db.execute("SELECT count(*) FROM task_publications_v5").fetchone()[0] != before:
+            raise Yt2BiliError("AcFun 迁移前后投稿记录数量不一致。")
+        db.execute("DROP TABLE task_publications")
+        db.execute("ALTER TABLE task_publications_v5 RENAME TO task_publications")
+        db.execute("CREATE UNIQUE INDEX uq_douyin_source ON task_publications(account_id,source_video_id) WHERE platform='douyin'")
+        db.execute("CREATE UNIQUE INDEX uq_acfun_source ON task_publications(account_id,source_video_id) WHERE platform='acfun'")
+        db.execute("""CREATE TRIGGER immutable_publication_identity
+            BEFORE UPDATE OF platform,account_id,source_video_id,task_id ON task_publications
+            WHEN OLD.platform IS NOT NEW.platform OR OLD.source_video_id IS NOT NEW.source_video_id
+                OR OLD.task_id IS NOT NEW.task_id OR (OLD.account_id IS NOT NULL AND OLD.account_id IS NOT NEW.account_id)
+            BEGIN SELECT RAISE(ABORT,'PUBLICATION_IDENTITY_IMMUTABLE'); END""")
+        db.execute("""CREATE TABLE IF NOT EXISTS acfun_attempts(
+            attempt_id TEXT PRIMARY KEY, publication_id TEXT NOT NULL REFERENCES task_publications(publication_id),
+            phase TEXT NOT NULL, started_at TEXT NOT NULL, upload_task_id TEXT NOT NULL DEFAULT '',
+            video_id TEXT NOT NULL DEFAULT '', create_intent_at TEXT NOT NULL DEFAULT '',
+            douga_id TEXT NOT NULL DEFAULT '', media_sha256 TEXT NOT NULL DEFAULT '',
+            request_sha256 TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '')""")
+        if db.execute("PRAGMA foreign_key_check").fetchone():
+            raise Yt2BiliError("AcFun 迁移引用检查失败。")
+        db.execute("PRAGMA user_version=5")
+        db.execute("INSERT OR REPLACE INTO schema_migrations VALUES(5,?)", (_now(),))
+
+
 def items(store, task_id):
     with store._lock:
         task = store.require(task_id)
@@ -66,7 +118,11 @@ def ensure_bili(store, task):
 
 
 def dual(store, task_id):
-    return any(p["platform"] == "douyin" for p in items(store, task_id))
+    return multi_target(store, task_id)
+
+
+def multi_target(store, task_id):
+    return len(items(store, task_id)) > 1
 
 
 def change(store, publication_id, **values):
@@ -109,7 +165,13 @@ def prepare(store, task_id):
     task = store.require(task_id)
     for p in items(store, task_id):
         if p["status"] in TERMINAL | {"submission_unknown"}: continue
-        change(store, p["publication_id"], status="ready", error="", text=p["text"] or task.title_zh)
+        values = {"status": "ready", "error": "", "text": p["text"] or task.title_zh}
+        if p["platform"] == "acfun":
+            snapshot = json.loads(p["snapshot"])
+            snapshot.setdefault("title", task.title_zh)
+            snapshot.setdefault("description", task.desc_zh)
+            values["snapshot"] = json.dumps(snapshot, ensure_ascii=False)
+        change(store, p["publication_id"], **values)
 
 
 def freeze(store, task_id, targets=None):
@@ -119,7 +181,9 @@ def freeze(store, task_id, targets=None):
         for p in items(store, task_id):
             if selected is not None and p["publication_id"] not in selected: continue
             if p["status"] != "ready": continue
-            change(store, p["publication_id"], status="queued", snapshot=json.dumps({**json.loads(p["snapshot"]),
-                "title": task.title_zh, "description": task.desc_zh, "text": p["text"],
+            existing = json.loads(p["snapshot"])
+            change(store, p["publication_id"], status="queued", snapshot=json.dumps({**existing,
+                "title": existing.get("title", task.title_zh) if p["platform"] == "acfun" else task.title_zh,
+                "description": existing.get("description", task.desc_zh) if p["platform"] == "acfun" else task.desc_zh, "text": p["text"],
                 "account_id": p["account_id"], "metadata_revision": task.metadata_revision,
                 "revision": p["revision"]}, ensure_ascii=False))

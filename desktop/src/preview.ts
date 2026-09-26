@@ -9,6 +9,7 @@ const config = {
   theme: "dark",
   hwaccel: "auto",
   validation_cache: true,
+  acfun_experimental_enabled: false,
   has_deepl_key: false,
   translation_primary: "local_llm",
   translation_fallback_enabled: true,
@@ -163,6 +164,14 @@ export async function request(method: string, params: any): Promise<any> {
             auth_state: "valid",
           }
         : null,
+    };
+  }
+  if (method === "acfun.auth.status") {
+    const enabled = new URLSearchParams(location.search).get("acfun") === "1";
+    return {
+      enabled, can_sync: enabled, capabilities: { auto_publish: false, experimental: true },
+      account: enabled ? { account_id: "acfun-preview", binding_revision: 1, user_id: "12345", nickname: "AcFun 预览账号", auth_state: "valid" } : null,
+      error: enabled ? "" : "AcFun 实验性接入尚未启用。",
     };
   }
   if (method === "accounts.list") return { items: accounts, limit: 5 };

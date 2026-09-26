@@ -1,13 +1,14 @@
 export interface Publication {
   account_label?: string;
   publication_id: string;
-  platform: "bilibili" | "douyin";
+  platform: "bilibili" | "douyin" | "acfun";
   account_id: string;
   status: string;
   revision: number;
   text: string;
   remote_id: string;
   error: string;
+  snapshot?: string;
 }
 export interface Task {
   publications?: Publication[];
@@ -71,6 +72,8 @@ export interface Config {
 }
 export interface Progress {
   task_id?: string;
+  publication_id?: string;
+  platform?: "bilibili" | "douyin" | "acfun";
   run_id?: string;
   stage: string;
   percent?: number | null;

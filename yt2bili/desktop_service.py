@@ -52,8 +52,10 @@ class DesktopService:
             self.store = TaskStore(paths.root / "data/tasks.sqlite", self.emit)
             self.accounts = AccountService(paths.root, self.store, self.emit)
             from yt2bili.douyin import DouyinService
+            from yt2bili.acfun import AcfunService
             self.douyin = DouyinService(self.store, self.config, self.emit)
-            self.scheduler = Scheduler(self.store, self.config, self.emit, self.accounts, self.douyin)
+            self.acfun = AcfunService(self.store, self.config, self.emit)
+            self.scheduler = Scheduler(self.store, self.config, self.emit, self.accounts, self.douyin, self.acfun)
         except BaseException:
             self.owner_lock.__exit__(None, None, None)
             raise
@@ -88,6 +90,14 @@ class DesktopService:
             self.scheduler.sync_accounts(payload.get("account_id"))
         if event == "douyin.auth.changed" and hasattr(self, "scheduler"):
             self.scheduler.douyin_lane.wake(credentials=True)
+        if event == "acfun.auth.changed" and hasattr(self, "scheduler"):
+            self.scheduler.acfun_lane.wake(credentials=True)
+        if event == "acfun.queue.resume" and hasattr(self, "scheduler"):
+            lane = self.scheduler.acfun_lane
+            with lane.condition:
+                for item in lane.items:
+                    item.wait_reason, item.deadline = "", None
+                lane.condition.notify_all()
         if event == "douyin.queue.resume" and hasattr(self, "scheduler"):
             lane = self.scheduler.douyin_lane
             with lane.condition:
@@ -146,6 +156,10 @@ class DesktopService:
             "douyin.auth.cancel": lambda: self.douyin.request("POST", "/v1/auth/cancel"),
             "douyin.auth.clear": self.douyin.clear, "douyin.accounts.archive": self.douyin.archive,
             "douyin.accounts.resume_uploads": self.douyin.resume,
+            "acfun.auth.status": self.acfun.status, "acfun.auth.start": self.acfun.start,
+            "acfun.auth.poll": self.acfun.poll, "acfun.auth.cancel": self.acfun.cancel,
+            "acfun.auth.clear": self.acfun.clear, "acfun.accounts.archive": self.acfun.archive,
+            "acfun.accounts.resume_uploads": self.acfun.resume,
             "publications.update_metadata": self.update_publication,
             "publications.retry": self.retry_publication, "publications.abandon": self.abandon_publication,
             "publications.resolve": self.resolve_publication, "publications.cancel": self.cancel_publication,
@@ -159,8 +173,11 @@ class DesktopService:
         return handler(**params)
 
     def health(self):
-        return {"protocol_version": 2, "schema_version": 4, "account_limit": 5,
-                "capabilities": ["single_url", "account_lanes", "graceful_shutdown", "local_translation_v1", "douyin_sync_v1"],
+        capabilities = ["single_url", "account_lanes", "graceful_shutdown", "local_translation_v1", "douyin_sync_v1"]
+        if self.config.values.get("acfun_experimental_enabled"):
+            capabilities.append("acfun_sync_v1")
+        return {"protocol_version": 2, "schema_version": 5, "account_limit": 5,
+                "capabilities": capabilities,
                 "migration_notes": self.migration_notes, "version": "0.2.0-alpha.1", "queue": self.scheduler.snapshot(),
                 "data_dir": str(self.paths.root)}
 
@@ -279,18 +296,22 @@ class DesktopService:
             self.scheduler.signal.set()
             return result
 
-    def create(self, url, operation_id, account_id=None, mode="preview", sync_douyin=False, douyin_account_id=None, douyin_binding_revision=None):
+    def create(self, url, operation_id, account_id=None, mode="preview", sync_douyin=False, douyin_account_id=None, douyin_binding_revision=None,
+               sync_acfun=False, acfun_account_id=None, acfun_binding_revision=None):
         if type(sync_douyin) is not bool: raise Yt2BiliError("同步抖音必须为开关值。")
-        dy_account = None
+        if type(sync_acfun) is not bool: raise Yt2BiliError("同步 AcFun 必须为开关值。")
+        dy_account = ac_account = None
         video_id, canonical = parse_single_video_url(url)
         if mode not in ("preview", "auto"):
             raise Yt2BiliError("任务模式无效。")
         if not account_id or not isinstance(account_id, str):
             raise Yt2BiliError("请选择本次投稿的 Bilibili 账号。")
         def preflight():
-            nonlocal dy_account
+            nonlocal dy_account, ac_account
             if sync_douyin:
                 dy_account = self.douyin.check(douyin_account_id, douyin_binding_revision, auto=mode == "auto")
+            if sync_acfun:
+                ac_account = self.acfun.check(acfun_account_id, acfun_binding_revision, auto=mode == "auto")
             account = self.store.account(account_id)
             if self.translation_jobs.active():
                 raise Yt2BiliError("请等待翻译组件操作结束后创建任务。")
@@ -300,6 +321,10 @@ class DesktopService:
             account = self.store.account(account_id)
             old = self.store.for_account(video_id, account_id)
             if old:
+                selected = {"bilibili"} | ({"douyin"} if sync_douyin else set()) | ({"acfun"} if sync_acfun else set())
+                existing = {p["platform"] for p in publications.items(self.store, old.task_id)}
+                if selected != existing:
+                    raise Yt2BiliError("此 Bilibili 账号已有同视频任务，目标不可追加；请继续原任务。")
                 return {"task_id": old.task_id, "account_id": account_id, "created": False, "status": old.status}
             task = Task(video_id, canonical, "pending", task_id=str(uuid.uuid4()), account_id=account_id,
                         account_uid_snapshot=account["uid"], account_name_snapshot=account["nickname"] or account["uid"])
@@ -314,10 +339,21 @@ class DesktopService:
                 self.store._conn.execute("INSERT INTO task_publications(publication_id,task_id,platform,account_id,source_video_id) VALUES(?,?,'douyin',?,?)", (str(uuid.uuid4()), task.task_id, dy_account["account_id"], video_id))
                 dy = publications.for_platform(self.store, task.task_id, "douyin")
                 publications.change(self.store, dy["publication_id"], snapshot=json.dumps({k: dy_account[k] for k in ("client_key", "open_id", "nickname", "binding_revision")}))
+            if sync_acfun:
+                account_now = self.acfun.account()
+                if not account_now or account_now != ac_account:
+                    raise Yt2BiliError("AcFun 账号状态已变化，请重试。")
+                duplicate = self.store._conn.execute("SELECT task_id FROM task_publications WHERE platform='acfun' AND account_id=? AND source_video_id=?", (ac_account["account_id"], video_id)).fetchone()
+                if duplicate: raise Yt2BiliError("此 AcFun 账号已有同视频任务：" + duplicate[0] + "；请继续原任务。")
+                self.store._conn.execute("INSERT INTO task_publications(publication_id,task_id,platform,account_id,source_video_id) VALUES(?,?,'acfun',?,?)", (str(uuid.uuid4()), task.task_id, ac_account["account_id"], video_id))
+                ac = publications.for_platform(self.store, task.task_id, "acfun")
+                publications.change(self.store, ac["publication_id"], snapshot=json.dumps({"user_id": ac_account["user_id"], "nickname": ac_account["nickname"],
+                    "binding_revision": ac_account["binding_revision"], "adapter_version": ac_account["adapter_version"], "channel_id": 0, "tags": ["转载"]}, ensure_ascii=False))
             self.scheduler.add(task, mode)
             return {"task_id": task.task_id, "account_id": account_id, "created": True, "status": task.status}
         params = {"url": canonical, "account_id": account_id, "mode": mode}
         if sync_douyin: params.update(sync_douyin=True, douyin_account_id=douyin_account_id, douyin_binding_revision=douyin_binding_revision)
+        if sync_acfun: params.update(sync_acfun=True, acfun_account_id=acfun_account_id, acfun_binding_revision=acfun_binding_revision)
         return self.operation(operation_id, "tasks.create", action, params, preflight)
 
     def bind_legacy(self, task_id, account_id):
@@ -379,7 +415,7 @@ class DesktopService:
         return self.operation(operation_id, "tasks.retry", action, {"task_id": task_id, "use_current_translation_settings": use_current_translation_settings})
 
     def submit(self, task_id, operation_id, targets=None, revisions=None):
-        if targets is not None and (not isinstance(targets, list) or not targets or len(targets) > 2 or any(not isinstance(v, str) for v in targets) or len(set(targets)) != len(targets)):
+        if targets is not None and (not isinstance(targets, list) or not targets or len(targets) > 3 or any(not isinstance(v, str) for v in targets) or len(set(targets)) != len(targets)):
             raise Yt2BiliError("投稿目标列表无效。")
         if revisions is not None and not isinstance(revisions, dict): raise Yt2BiliError("投稿版本快照无效。")
         def action():
@@ -394,6 +430,10 @@ class DesktopService:
             self.store.account(task.account_id, active=any(p["platform"] == "bilibili" for p in selected))
             if not selected or any(p["status"] != "ready" for p in selected): raise Yt2BiliError("投稿目标尚未准备好。")
             if revisions is not None and any(revisions.get(p["publication_id"]) != p["revision"] for p in selected): raise Yt2BiliError("文案已变化，请刷新预览后确认。")
+            for p in selected:
+                if p["platform"] == "acfun":
+                    self.acfun.check(p["account_id"])
+                    self.acfun.validate_assets(type("TaskRef", (), {"task_id": task_id})(), json.loads(p["snapshot"]))
             publications.freeze(self.store, task_id, [p["publication_id"] for p in selected])
             self.scheduler.add(task, "submit", saved.get("settings"), stage="validate", targets=[p["publication_id"] for p in selected])
             return {"queued": True}
@@ -406,14 +446,25 @@ class DesktopService:
             self.ensure_idle()
             return self.douyin.configure(url, pairing_key)
 
-    def update_publication(self, publication_id, text, revision):
+    def update_publication(self, publication_id, text=None, revision=None, title=None, description=None, channel_id=None, tags=None):
         with self.mutation, self.store.transaction():
             p = publications.get(self.store, publication_id)
             self.ensure_inactive(p["task_id"])
-            if p["platform"] != "douyin" or p["status"] != "ready" or p["revision"] != revision:
-                raise Yt2BiliError("只能编辑预览中的抖音文案，请刷新后重试。")
-            if not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000: raise Yt2BiliError("抖音文案须为 1～1000 字。")
-            publications.change(self.store, publication_id, text=text.strip())
+            if p["status"] != "ready" or p["revision"] != revision:
+                raise Yt2BiliError("只能编辑预览中的投稿目标，请刷新后重试。")
+            if p["platform"] == "douyin":
+                if not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000: raise Yt2BiliError("抖音文案须为 1～1000 字。")
+                publications.change(self.store, publication_id, text=text.strip())
+            elif p["platform"] == "acfun":
+                if not isinstance(title, str) or not 1 <= len(title.strip()) <= 50: raise Yt2BiliError("AcFun 标题须为 1～50 字。")
+                if not isinstance(description, str) or len(description) > 1000: raise Yt2BiliError("AcFun 简介不能超过 1000 字。")
+                if type(channel_id) is not int or channel_id <= 0: raise Yt2BiliError("请选择有效 AcFun 分区 ID。")
+                if not isinstance(tags, list) or len(tags) > 6 or any(not isinstance(t, str) or not t.strip() or len(t) > 30 for t in tags):
+                    raise Yt2BiliError("AcFun 标签最多 6 个，每个不超过 30 字。")
+                snapshot = json.loads(p["snapshot"])
+                snapshot.update(title=title.strip(), description=description, channel_id=channel_id, tags=[t.strip() for t in tags])
+                publications.change(self.store, publication_id, snapshot=json.dumps(snapshot, ensure_ascii=False))
+            else: raise Yt2BiliError("此平台不支持编辑投稿目标。")
             return publications.get(self.store, publication_id)
 
     def retry_publication(self, publication_id, operation_id):
@@ -422,6 +473,8 @@ class DesktopService:
             self.ensure_inactive(p["task_id"])
             if p["status"] not in ("failed", "cancelled", "interrupted", "blocked_validation"):
                 raise Yt2BiliError("只能继续已失败、取消或中断的目标；结果待核对时禁止重投。")
+            if p["platform"] == "acfun" and self.store._conn.execute("SELECT 1 FROM acfun_attempts WHERE publication_id=? AND create_intent_at!='' AND phase!='resolved_not_submitted'", (publication_id,)).fetchone():
+                raise Yt2BiliError("AcFun 已记录创建作品意图，须先核对；禁止重投。")
             task = self.task(p["task_id"])
             if not task.video_path or not Path(task.video_path).is_file(): raise Yt2BiliError("本地素材缺失，请先恢复素材；不会自动重发已成功目标。")
             publications.change(self.store, publication_id, status="ready", error="")
@@ -462,8 +515,12 @@ class DesktopService:
             if p["status"] != "submission_unknown": raise Yt2BiliError("此目标无需核对。")
             if not_submitted is not True and (not isinstance(remote_id, str) or not remote_id.strip() or len(remote_id) > 512): raise Yt2BiliError("请填写已核对的作品 ID。")
             if p["platform"] == "bilibili" and not not_submitted and not re.fullmatch(r"BV[0-9A-Za-z]{10}", remote_id): raise Yt2BiliError("BV 号格式无效。")
+            if p["platform"] == "acfun" and not not_submitted and not re.fullmatch(r"(?i:AC)[1-9][0-9]*", remote_id): raise Yt2BiliError("AC 号格式无效。")
             if p["platform"] == "douyin":
                 self.douyin.request("POST", "/v1/publications/" + publication_id + "/resolve", {"not_submitted": not_submitted, "remote_id": remote_id})
+            if p["platform"] == "acfun":
+                self.store._conn.execute("UPDATE acfun_attempts SET phase=?,douga_id=? WHERE publication_id=? AND create_intent_at!=''",
+                    ("resolved_not_submitted" if not_submitted else "manually_submitted", "" if not_submitted else remote_id.removeprefix("AC"), publication_id))
             publications.change(self.store, publication_id, status="interrupted" if not_submitted else "submitted", remote_id="" if not_submitted else remote_id, retain_assets=1, error="用户核对结果；保留本地素材。")
             if p["platform"] == "bilibili" and not not_submitted: self.store.update(p["task_id"], bv_id=remote_id)
             publications.project(self.store, p["task_id"])
@@ -682,13 +739,13 @@ class DesktopService:
                 raise Yt2BiliError("请选择另一个有效项目的数据目录。")
             with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as old:
                 version = old.execute("PRAGMA user_version").fetchone()[0]
-                if version > 4:
+                if version > 5:
                     raise Yt2BiliError("不支持的来源数据库版本。")
                 old.row_factory = sqlite3.Row
                 rows = [dict(r) for r in old.execute("SELECT * FROM tasks")]
                 tables = {r[0] for r in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if "task_publications" in tables and old.execute("SELECT 1 FROM task_publications WHERE platform='douyin'").fetchone():
-                    raise Yt2BiliError("包含抖音投稿的数据须整体备份/恢复，不能以旧版导入方式重建投稿身份；源数据未修改。")
+                if "task_publications" in tables and old.execute("SELECT 1 FROM task_publications WHERE platform IN ('douyin','acfun')").fetchone():
+                    raise Yt2BiliError("包含抖音或 AcFun 投稿的数据须整体备份/恢复，不能以旧版导入方式重建投稿身份；源数据未修改。")
                 records = {r[0]: json.loads(r[1]) for r in old.execute("SELECT * FROM task_translation")} if "task_translation" in tables else {}
                 attempts = [dict(r) for r in old.execute("SELECT * FROM translation_attempts ORDER BY id")] if "translation_attempts" in tables else []
             source_id = hashlib.sha256(str(db).encode()).hexdigest()

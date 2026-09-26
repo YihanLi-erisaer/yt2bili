@@ -65,7 +65,7 @@ class AccountLane:
         with self.condition:
             if credentials:
                 for item in self.items:
-                    if self.platform == "douyin" and item.wait_reason == "rate_limited": continue
+                    if self.platform in ("douyin", "acfun") and item.wait_reason == "rate_limited": continue
                     item.deadline, item.wait_reason = 0, ""
             self.condition.notify_all()
 
@@ -104,6 +104,17 @@ class AccountLane:
                             reason, deadline = "auth_required", None
                         except RateLimited:
                             reason, deadline = "rate_limited", None
+                    elif self.platform == "acfun":
+                        from yt2bili.acfun import AuthRequired, RateLimited
+                        try:
+                            self.scheduler.acfun.publish(item)
+                            reason, deadline = "finished", None
+                        except AuthRequired:
+                            with self.scheduler.store.transaction() as db:
+                                db.execute("UPDATE acfun_accounts SET auth_state='expired' WHERE lifecycle='active'")
+                            reason, deadline = "auth_required", None
+                        except RateLimited:
+                            reason, deadline = "rate_limited", None
                     else:
                         reason, deadline = self.scheduler.uploader.try_submit(item)
                     finished = reason == "finished"
@@ -127,9 +138,10 @@ class AccountLane:
 
 
 class Scheduler:
-    def __init__(self, store, config, emit, accounts, douyin=None):
+    def __init__(self, store, config, emit, accounts, douyin=None, acfun=None):
         self.store, self.config, self.emit, self.accounts = store, config, emit, accounts
         self.douyin = douyin
+        self.acfun = acfun
         self.guard = threading.RLock()
         self.active, self.upload_lanes = {}, {}
         self.closing = False
@@ -142,6 +154,7 @@ class Scheduler:
         self._recover()
         self.sync_accounts()
         self.douyin_lane = AccountLane(self, "douyin", "douyin")
+        self.acfun_lane = AccountLane(self, "acfun", "acfun")
         self.threads = [threading.Thread(target=self._work, args=(stage,), name=f"desktop-{stage}", daemon=True)
                         for stage in ["download", "validate"] + ["prepare"] * 5]
         for thread in self.threads:
@@ -151,9 +164,11 @@ class Scheduler:
 
     def _recover(self):
         for task in self.store.list_all():
-            if publications.dual(self.store, task.task_id):
+            if publications.multi_target(self.store, task.task_id):
                 for p in publications.items(self.store, task.task_id):
-                    if p["status"] in ("creating", "submission_unknown") or p["platform"] == "bilibili" and p["status"] == "uploading_media":
+                    acfun_uncertain = p["platform"] == "acfun" and p["status"] == "uploading_media" and bool(
+                        self.store._conn.execute("SELECT 1 FROM acfun_attempts WHERE publication_id=? AND phase IN ('creating_video','cover','creating')", (p["publication_id"],)).fetchone())
+                    if p["status"] in ("creating", "submission_unknown") or p["platform"] == "bilibili" and p["status"] == "uploading_media" or acfun_uncertain:
                         publications.change(self.store, p["publication_id"], status="submission_unknown", error="上次投稿结果待核对，不会自动重投。")
                     elif p["status"] not in publications.TERMINAL | {"ready", "failed", "cancelled", "interrupted", "blocked_validation"}:
                         publications.change(self.store, p["publication_id"], status="interrupted", error="上次运行中断，请手动继续。")
@@ -305,7 +320,7 @@ class Scheduler:
                             cancelled = True
                     publications.project(self.store, task_id)
                 if not cancelled: raise Yt2BiliError("所有剩余目标均已在途或待核对，请等待并核对结果。")
-                for lane in [*self.upload_lanes.values(), self.douyin_lane]: lane.wake()
+                for lane in [*self.upload_lanes.values(), self.douyin_lane, self.acfun_lane]: lane.wake()
                 return
         with self.store.transaction():
             task = self.store.require(identity)
@@ -333,6 +348,7 @@ class Scheduler:
             for lane in self.upload_lanes.values():
                 lane.wake()
             self.douyin_lane.wake()
+            self.acfun_lane.wake()
         self.signal.set()
 
     def _work(self, stage):
@@ -460,7 +476,8 @@ class Scheduler:
                                 children={}, payload=dict(item.payload), stage="upload", wait_reason="", deadline=None)
                 item.children[p["platform"]] = child
             for child in list(item.children.values()):
-                (self.douyin_lane if child.platform == "douyin" else self.upload_lanes[item.job.task.account_id]).put(child)
+                ({"douyin": self.douyin_lane, "acfun": self.acfun_lane}.get(child.platform)
+                 or self.upload_lanes[item.job.task.account_id]).put(child)
 
     def snapshot(self):
         with self.guard:
@@ -487,8 +504,10 @@ class Scheduler:
                     "queued_count": sum(not i.running for i in selected), "wait_reason": waiting.wait_reason if waiting else "",
                     "remaining_seconds": max(0, waiting.deadline-time.monotonic()) if waiting and waiting.deadline else None})
             dy = list(self.douyin_lane.items)
+            ac = list(self.acfun_lane.items)
             return {"queue_revision": self.queue_revision, "active": active, "download": shared("download"), "validate": shared("validate"), "prepare": shared("prepare"), "uploads": uploads,
-                    "douyin": {"running_task_id": next((i.task_id for i in dy if i.running), None), "queued_count": sum(not i.running for i in dy), "wait_reason": next((i.wait_reason for i in dy if i.wait_reason), "")}}
+                    "douyin": {"running_task_id": next((i.task_id for i in dy if i.running), None), "queued_count": sum(not i.running for i in dy), "wait_reason": next((i.wait_reason for i in dy if i.wait_reason), "")},
+                    "acfun": {"running_task_id": next((i.task_id for i in ac if i.running), None), "queued_count": sum(not i.running for i in ac), "wait_reason": next((i.wait_reason for i in ac if i.wait_reason), "")}}
 
     def prepare_shutdown(self):
         self.closing = True
@@ -497,7 +516,7 @@ class Scheduler:
                 for child in root.children.values():
                     p = publications.for_platform(self.store, child.task_id, child.platform)
                     if p["status"] not in publications.INFLIGHT: child.cancel.set()
-            for lane in [*self.upload_lanes.values(), self.douyin_lane]: lane.wake()
+            for lane in [*self.upload_lanes.values(), self.douyin_lane, self.acfun_lane]: lane.wake()
         for task in self.store.list_all():
             saved = self.store.get_job(task.task_id) or {}
             if saved.get("owner_session_id") == self.session_id and saved.get("execution_state") in ("running", "queued", "waiting") and task.status != "uploading":
@@ -527,7 +546,7 @@ class Scheduler:
             for _ in range(5 if stage == "prepare" else 1): queue_.put(None)
         for thread in self.threads:
             thread.join()
-        for lane in [*self.upload_lanes.values(), self.douyin_lane]:
+        for lane in [*self.upload_lanes.values(), self.douyin_lane, self.acfun_lane]:
             with lane.condition:
                 lane.stopped = True
                 lane.condition.notify_all()
